@@ -816,6 +816,211 @@ def build_upsert_statements(
     return statements
 
 # ==============================================================================
+# FIFO INTRADAY RETENTION & STORAGE GUARD
+# ==============================================================================
+
+MAX_FREE_QUOTA_MB = 5120.0       # 5.0 GB free quota
+TRIGGER_THRESHOLD_MB = 4096.0    # 4.0 GB (80% trigger threshold)
+MIN_RETENTION_DAYS = 365         # Strict 1-year safety lock
+PRUNE_CHUNK_DAYS = 7             # Purge 1 week per cycle
+INTRADAY_TABLES = [
+    "spot_snapshots",
+    "futures_snapshots",
+    "options_snapshots"
+]
+
+def run_fifo_retention_guard(pipeline_url: str = None, auth_token: str = None, db_file: str = None):
+    """
+    Automated FIFO Intraday Retention Guard.
+    1. Inspects current DB size via PRAGMA page_count and page_size.
+    2. Logs storage health relative to 5.0 GB (5,120 MB) quota.
+    3. If size exceeds 4.0 GB (4,096 MB / 80%):
+       - Searches oldest date across spot_snapshots, futures_snapshots, options_snapshots.
+       - Enforces Safety Lock: Must be at least 365 days old (never delete recent data).
+       - Deletes oldest data in 7-day chunks from intraday tables.
+       - Reclaims space and logs updated size.
+    * Note: eod_* tables are strictly untouched and preserved indefinitely.
+    """
+    now_bkk = datetime.datetime.now(BKK_TZ)
+    current_date = now_bkk.date()
+
+    page_count = 0
+    page_size = 4096
+    is_turso = bool(pipeline_url and auth_token)
+
+    if is_turso:
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+        reqs = [
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
+            {"type": "close"}
+        ]
+        try:
+            r = requests.post(pipeline_url, headers=headers, json={"requests": reqs}, timeout=20)
+            if r.status_code == 200:
+                res = r.json()
+                page_count = int(res["results"][0]["response"]["result"]["rows"][0][0]["value"])
+                page_size = int(res["results"][1]["response"]["result"]["rows"][0][0]["value"])
+        except Exception as e:
+            print(f"[STORAGE GUARD] Warning: Failed to query Turso PRAGMA: {e}")
+            return
+    else:
+        target_db = db_file or "eod_tfex.db"
+        if not os.path.exists(target_db):
+            return
+        try:
+            conn = sqlite3.connect(target_db)
+            cur = conn.cursor()
+            cur.execute("PRAGMA page_count;")
+            page_count = cur.fetchone()[0]
+            cur.execute("PRAGMA page_size;")
+            page_size = cur.fetchone()[0]
+            conn.close()
+        except Exception as e:
+            print(f"[STORAGE GUARD] Warning: Failed to query local SQLite PRAGMA: {e}")
+            return
+
+    db_bytes = page_count * page_size
+    db_mb = db_bytes / (1024 * 1024)
+    usage_pct = (db_mb / MAX_FREE_QUOTA_MB) * 100
+    status_label = "Healthy" if db_mb < TRIGGER_THRESHOLD_MB else "Action Required (> 80%)"
+
+    print("=" * 70)
+    print("STORAGE MANAGEMENT & RETENTION AUDIT")
+    print("=" * 70)
+    print(f"[STORAGE GUARD] Current DB Size: {db_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({usage_pct:.2f}%) - {status_label}")
+
+    if db_mb < TRIGGER_THRESHOLD_MB:
+        print("[STORAGE GUARD] Storage within healthy limit (< 80%). No retention purging needed.")
+        return
+
+    # Trigger threshold exceeded!
+    print(f"[STORAGE GUARD] WARNING: DB Size ({db_mb:.2f} MB) exceeds 80% threshold ({TRIGGER_THRESHOLD_MB:.0f} MB).")
+    print("[STORAGE GUARD] Evaluating FIFO Intraday Retention for spot, futures, and options snapshots...")
+
+    oldest_dates = []
+
+    if is_turso:
+        reqs = []
+        for tbl in INTRADAY_TABLES:
+            reqs.append({"type": "execute", "stmt": {"sql": f"SELECT MIN(captured_at_bkk) FROM {tbl};"}})
+        reqs.append({"type": "close"})
+
+        try:
+            r = requests.post(pipeline_url, headers=headers, json={"requests": reqs}, timeout=20)
+            if r.status_code == 200:
+                res = r.json()
+                for idx, tbl in enumerate(INTRADAY_TABLES):
+                    result_item = res["results"][idx]
+                    if result_item.get("type") == "ok":
+                        rows = result_item["response"]["result"]["rows"]
+                        if rows and rows[0][0]["type"] != "null":
+                            val = rows[0][0]["value"]
+                            if val:
+                                oldest_dates.append((val[:10], tbl))
+        except Exception as e:
+            print(f"[STORAGE GUARD] Error checking intraday timestamps: {e}")
+            return
+    else:
+        try:
+            conn = sqlite3.connect(target_db)
+            cur = conn.cursor()
+            for tbl in INTRADAY_TABLES:
+                cur.execute(f"SELECT MIN(captured_at_bkk) FROM {tbl};")
+                row = cur.fetchone()
+                if row and row[0]:
+                    oldest_dates.append((str(row[0])[:10], tbl))
+            conn.close()
+        except Exception as e:
+            print(f"[STORAGE GUARD] Error checking local intraday timestamps: {e}")
+            return
+
+    if not oldest_dates:
+        print("[STORAGE GUARD] Intraday snapshot tables are empty or uninitialized. Skipping.")
+        return
+
+    oldest_dates.sort(key=lambda x: x[0])
+    oldest_date_str = oldest_dates[0][0]
+
+    try:
+        oldest_date = datetime.datetime.strptime(oldest_date_str, "%Y-%m-%d").date()
+    except Exception as e:
+        print(f"[STORAGE GUARD] Error parsing oldest date '{oldest_date_str}': {e}")
+        return
+
+    age_days = (current_date - oldest_date).days
+
+    # Safety Lock: MUST be at least 365 days old
+    if age_days < MIN_RETENTION_DAYS:
+        print(f"[STORAGE GUARD] SAFETY LOCK ENGAGED: Oldest intraday record ({oldest_date_str}) is only {age_days} days old (< {MIN_RETENTION_DAYS} days).")
+        print("[STORAGE GUARD] All intraday data within 1 year is strictly protected. Zero records deleted.")
+        return
+
+    # FIFO Pruning: Purge 7 days from oldest date
+    cutoff_date = oldest_date + datetime.timedelta(days=PRUNE_CHUNK_DAYS)
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d 23:59:59")
+    print(f"[STORAGE GUARD] FIFO Pruning: Purging 7 days of historical intraday data (from {oldest_date_str} up to {cutoff_date})...")
+
+    if is_turso:
+        purge_reqs = []
+        for tbl in INTRADAY_TABLES:
+            purge_reqs.append({
+                "type": "execute",
+                "stmt": {
+                    "sql": f"DELETE FROM {tbl} WHERE captured_at_bkk <= ?;",
+                    "args": [{"type": "text", "value": cutoff_str}]
+                }
+            })
+        purge_reqs.append({"type": "close"})
+
+        try:
+            r = requests.post(pipeline_url, headers=headers, json={"requests": purge_reqs}, timeout=30)
+            if r.status_code == 200:
+                print(f"[STORAGE GUARD] Successfully purged intraday records up to {cutoff_str}.")
+        except Exception as e:
+            print(f"[STORAGE GUARD] Error during purge: {e}")
+            return
+
+        check_reqs = [
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
+            {"type": "close"}
+        ]
+        try:
+            r = requests.post(pipeline_url, headers=headers, json={"requests": check_reqs}, timeout=20)
+            if r.status_code == 200:
+                res = r.json()
+                new_pc = int(res["results"][0]["response"]["result"]["rows"][0][0]["value"])
+                new_ps = int(res["results"][1]["response"]["result"]["rows"][0][0]["value"])
+                new_mb = (new_pc * new_ps) / (1024 * 1024)
+                print(f"[STORAGE GUARD] Post-cleanup DB Size: {new_mb:.2f} MB (Reclaimed: {db_mb - new_mb:.2f} MB)")
+        except Exception:
+            pass
+    else:
+        try:
+            conn = sqlite3.connect(target_db)
+            cur = conn.cursor()
+            for tbl in INTRADAY_TABLES:
+                cur.execute(f"DELETE FROM {tbl} WHERE captured_at_bkk <= ?;", (cutoff_str,))
+            conn.commit()
+            try:
+                cur.execute("VACUUM;")
+            except Exception:
+                pass
+            cur.execute("PRAGMA page_count;")
+            new_pc = cur.fetchone()[0]
+            cur.execute("PRAGMA page_size;")
+            new_ps = cur.fetchone()[0]
+            conn.close()
+            new_mb = (new_pc * new_ps) / (1024 * 1024)
+            print(f"[STORAGE GUARD] Post-cleanup DB Size: {new_mb:.2f} MB (Reclaimed: {db_mb - new_mb:.2f} MB)")
+        except Exception as e:
+            print(f"[STORAGE GUARD] Error during local purge/vacuum: {e}")
+
+# ==============================================================================
 # MAIN ORCHESTRATOR
 # ==============================================================================
 
@@ -904,6 +1109,14 @@ def main():
     print(f"4. Options Series   : {len(opt_series):>5} rows")
     print(f"5. BOT THOR Rates   : {len(thor_rates):>5} rows (trade_date: {thor_rates[0]['trade_date'] if thor_rates else 'N/A'})")
     print(f"Total Execution Time: {time.time() - start_time:.2f} seconds.")
+    # 6. Automated FIFO Intraday Retention & Storage Guard
+    if turso_url and turso_token:
+        pipeline_url = normalize_turso_url(turso_url)
+        run_fifo_retention_guard(pipeline_url=pipeline_url, auth_token=turso_token)
+    else:
+        db_file = args.local_db or "eod_tfex.db"
+        run_fifo_retention_guard(db_file=db_file)
+
     print("=" * 70)
     print("SUCCESS: Stateless EOD Data Collection completed idempotently.")
 
