@@ -1,0 +1,48 @@
+name: Stateless EOD Data Collector
+
+on:
+  schedule:
+    # 21:00 ICT (14:00 UTC) Mon-Fri
+    - cron: '0 14 * * 1-5'
+    # 01:00 ICT next day (18:00 UTC) Mon-Fri
+    - cron: '0 18 * * 1-5'
+    # 06:15 ICT next day (23:15 UTC) Mon-Fri
+    - cron: '15 23 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run regardless of weekends or holidays'
+        type: boolean
+        default: false
+        required: false
+
+jobs:
+  collect-eod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run EOD Data Collector
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
+            python eod_collector.py --force
+          else
+            python eod_collector.py
+          fi
