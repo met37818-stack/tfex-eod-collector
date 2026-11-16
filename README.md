@@ -28,16 +28,18 @@ Stateless Python EOD Data Collector สำหรับดึงข้อมู�
 |---|---|---|
 | `TURSO_DATABASE_URL` | `libsql://your-db-org.turso.io` | URL ฐานข้อมูล Turso (สคริปต์จะแปลงเป็น `https://.../v2/pipeline` อัตโนมัติ) |
 | `TURSO_AUTH_TOKEN` | `eyJhbGciOi...` | JWT Auth Token ที่ได้จากคำสั่ง `turso db tokens create <db-name>` |
+| `TELEGRAM_BOT_TOKEN` | `9267903435:AAE...` | Bot Token สำหรับส่งแจ้งเตือนสถานะ EOD เข้า Telegram |
+| `TELEGRAM_CHAT_ID` | `1427208361` | Telegram Chat ID ผู้รับการแจ้งเตือน |
 
 ---
 
 ## 3. รอบการทำงานอัตโนมัติ (GitHub Actions Schedule)
 
-Workflow ถูกตั้งค่าไว้ใน [`.github/workflows/collect_eod.yml`](.github/workflows/collect_eod.yml) รันวันจันทร์–ศุกร์วันละ 3 รอบตามเวลาประเทศไทย:
+Workflow ถูกตั้งค่าไว้ใน [`.github/workflows/collect_eod.yml`](.github/workflows/collect_eod.yml) รันวันจันทร์–ศุกร์ตามเวลาประเทศไทย:
 
 - `0 14 * * 1-5` : **21:00 น. วัน T** (สรุปข้อมูลรอบหัวค่ำหลังตลาดปิด)
 - `0 18 * * 1-5` : **01:00 น. วัน T+1** (อัปเดตข้อมูลรอบดึกหลัง SET/TFEX ปรับปรุงระบบ EOD)
-- `15 23 * * 1-5` : **06:15 น. วัน T+1** (ตรวจสอบความครบถ้วนรอบสุดท้ายก่อนตลาดเปิดวันถัดไป)
+- `15 23 * * 0-4` : **06:15 น. วันจันทร์–ศุกร์** (ตรวจสอบความครบถ้วนรอบสุดท้ายและส่งแจ้งเตือน Telegram ก่อนตลาดเปิด)
 
 ### การสั่งรันแบบ Manual (Workflow Dispatch):
 สามารถกด **Run workflow** ได้จากแท็บ Actions บน GitHub โดยมีตัวเลือก:
@@ -59,13 +61,13 @@ python -m pip install -r requirements.txt
 python eod_collector.py --force --local-db eod_tfex.db
 ```
 
-### 4.3 ทดสอบด้วย Turso Cloud จริง
+### 4.3 ทดสอบด้วย Turso Cloud จริง และส่งแจ้งเตือน Telegram
 1. คัดลอกไฟล์ `.env.example` เป็น `.env`:
    ```bash
    cp .env.example .env
    ```
-2. แก้ไขค่า `TURSO_DATABASE_URL` และ `TURSO_AUTH_TOKEN` ใน `.env`
-3. รันสคริปต์:
+2. แก้ไขค่า `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` ใน `.env`
+3. รันสคริปต์และทดสอบส่ง Telegram Alert ทันที:
    ```bash
-   python eod_collector.py --force
+   python eod_collector.py --notify
    ```

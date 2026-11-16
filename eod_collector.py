@@ -162,7 +162,11 @@ def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str
         ref_time = ref_time.astimezone(BKK_TZ)
 
     if ref_time.hour < 9:
-        target_date = (ref_time - datetime.timedelta(days=1)).date()
+        # On Monday morning before 09:00 ICT, the relevant trade session is Friday (T-3)
+        if ref_time.weekday() == 0:
+            target_date = (ref_time - datetime.timedelta(days=3)).date()
+        else:
+            target_date = (ref_time - datetime.timedelta(days=1)).date()
     else:
         target_date = ref_time.date()
 
@@ -625,6 +629,13 @@ DDL_STATEMENTS = [
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (trade_date)
     );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS eod_telegram_log (
+        trade_date TEXT NOT NULL PRIMARY KEY,
+        notified_at_bkk TEXT NOT NULL,
+        message_snippet TEXT
+    );
     """
 ]
 
@@ -1021,6 +1032,246 @@ def run_fifo_retention_guard(pipeline_url: str = None, auth_token: str = None, d
             print(f"[STORAGE GUARD] Error during local purge/vacuum: {e}")
 
 # ==============================================================================
+# TELEGRAM EOD COMPLETION NOTIFIER
+# ==============================================================================
+
+def send_eod_telegram_alert(
+    bot_token: str,
+    chat_id: str,
+    pipeline_url: str = None,
+    auth_token: str = None,
+    db_file: str = None,
+    force_notify: bool = False
+) -> bool:
+    """
+    Sends EOD data collection summary alert to Telegram on Mon-Fri morning (05:30 - 07:30 ICT).
+    Checks eod_telegram_log to avoid duplicate alerts for the same trade_date.
+    """
+    now_bkk = datetime.datetime.now(BKK_TZ)
+    now_bkk_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S ICT")
+    is_turso = bool(pipeline_url and auth_token)
+
+    print("=" * 70)
+    print("TELEGRAM EOD COMPLETION NOTIFIER")
+    print("=" * 70)
+
+    # 1. Check Day-of-Week (Mon-Fri only)
+    if not force_notify:
+        if now_bkk.weekday() not in (0, 1, 2, 3, 4):
+            weekday_name = now_bkk.strftime("%A")
+            print(f"[TELEGRAM] Skipped: Today is {weekday_name} (weekend). Alerts sent Mon-Fri only.")
+            return False
+
+        # 2. Check Time Window (05:30 - 07:30 ICT)
+        curr_time = now_bkk.time()
+        start_w = datetime.time(5, 30)
+        end_w = datetime.time(7, 30)
+        if not (start_w <= curr_time <= end_w):
+            print(f"[TELEGRAM] Skipped: Current time {curr_time.strftime('%H:%M')} is outside the 05:30-07:30 notification window.")
+            return False
+    else:
+        print("[TELEGRAM] --notify flag detected. Bypassing day-of-week and time-window checks.")
+
+    # 3. Retrieve Latest EOD Status & Check Duplicate Log
+    latest_date = None
+    already_notified = False
+    prev_notified_at = None
+    fut_cnt = 0
+    opt_cnt = 0
+    inv_cnt = 0
+    mkt_cnt = 0
+    thor_rate = None
+    thor_1m = None
+    thor_date = None
+    size_mb = 0.0
+
+    if is_turso:
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+        reqs1 = [
+            {"type": "execute", "stmt": {"sql": "SELECT MAX(trade_date) FROM eod_futures_series;"}},
+            {"type": "execute", "stmt": {"sql": "SELECT trade_date, thor_rate, thor_1m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"}},
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
+            {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
+            {"type": "close"}
+        ]
+        try:
+            r1 = requests.post(pipeline_url, headers=headers, json={"requests": reqs1}, timeout=20)
+            if r1.status_code == 200:
+                res1 = r1.json()
+                rows0 = res1["results"][0]["response"]["result"]["rows"]
+                if rows0 and rows0[0][0]["type"] != "null":
+                    latest_date = rows0[0][0]["value"]
+
+                rows1 = res1["results"][1]["response"]["result"]["rows"]
+                if rows1:
+                    thor_date = rows1[0][0]["value"]
+                    thor_rate = clean_float(rows1[0][1]["value"])
+                    thor_1m = clean_float(rows1[0][2]["value"])
+
+                pc = int(res1["results"][2]["response"]["result"]["rows"][0][0]["value"])
+                ps = int(res1["results"][3]["response"]["result"]["rows"][0][0]["value"])
+                size_mb = (pc * ps) / (1024 * 1024)
+        except Exception as e:
+            print(f"[TELEGRAM] Error retrieving Turso status: {e}")
+            return False
+
+        if not latest_date:
+            print("[TELEGRAM] No data found in eod_futures_series. Skipping notification.")
+            return False
+
+        reqs2 = [
+            {"type": "execute", "stmt": {"sql": "SELECT notified_at_bkk FROM eod_telegram_log WHERE trade_date = ?;", "args": [{"type": "text", "value": latest_date}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM eod_futures_series WHERE trade_date = ?;", "args": [{"type": "text", "value": latest_date}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM eod_options_series WHERE trade_date = ?;", "args": [{"type": "text", "value": latest_date}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM eod_investor_types WHERE trade_date = ?;", "args": [{"type": "text", "value": latest_date}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM eod_market_stats WHERE trade_date = ?;", "args": [{"type": "text", "value": latest_date}]}},
+            {"type": "close"}
+        ]
+        try:
+            r2 = requests.post(pipeline_url, headers=headers, json={"requests": reqs2}, timeout=20)
+            if r2.status_code == 200:
+                res2 = r2.json()
+                log_rows = res2["results"][0]["response"]["result"]["rows"]
+                if log_rows and len(log_rows) > 0:
+                    already_notified = True
+                    prev_notified_at = log_rows[0][0]["value"]
+                fut_cnt = int(res2["results"][1]["response"]["result"]["rows"][0][0]["value"])
+                opt_cnt = int(res2["results"][2]["response"]["result"]["rows"][0][0]["value"])
+                inv_cnt = int(res2["results"][3]["response"]["result"]["rows"][0][0]["value"])
+                mkt_cnt = int(res2["results"][4]["response"]["result"]["rows"][0][0]["value"])
+        except Exception as e:
+            print(f"[TELEGRAM] Error querying row counts: {e}")
+            return False
+    else:
+        target_db = db_file or "eod_tfex.db"
+        if not os.path.exists(target_db):
+            print(f"[TELEGRAM] Local database {target_db} not found.")
+            return False
+        try:
+            conn = sqlite3.connect(target_db)
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(trade_date) FROM eod_futures_series;")
+            row = cur.fetchone()
+            latest_date = row[0] if row else None
+            if not latest_date:
+                conn.close()
+                return False
+
+            cur.execute("SELECT notified_at_bkk FROM eod_telegram_log WHERE trade_date = ?;", (latest_date,))
+            log_row = cur.fetchone()
+            if log_row:
+                already_notified = True
+                prev_notified_at = log_row[0]
+
+            cur.execute("SELECT COUNT(*) FROM eod_futures_series WHERE trade_date = ?;", (latest_date,))
+            fut_cnt = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM eod_options_series WHERE trade_date = ?;", (latest_date,))
+            opt_cnt = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM eod_investor_types WHERE trade_date = ?;", (latest_date,))
+            inv_cnt = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM eod_market_stats WHERE trade_date = ?;", (latest_date,))
+            mkt_cnt = cur.fetchone()[0]
+
+            cur.execute("SELECT trade_date, thor_rate, thor_1m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;")
+            t_row = cur.fetchone()
+            if t_row:
+                thor_date, thor_rate, thor_1m = t_row[0], clean_float(t_row[1]), clean_float(t_row[2])
+
+            cur.execute("PRAGMA page_count;")
+            pc = cur.fetchone()[0]
+            cur.execute("PRAGMA page_size;")
+            ps = cur.fetchone()[0]
+            size_mb = (pc * ps) / (1024 * 1024)
+            conn.close()
+        except Exception as e:
+            print(f"[TELEGRAM] Error querying local SQLite: {e}")
+            return False
+
+    # Check (c) Duplicate notification guard
+    if already_notified and not force_notify:
+        print(f"[TELEGRAM] Skipped: Trade date {latest_date} was already notified on {prev_notified_at}.")
+        return False
+
+    # 4. Format Telegram HTML Message
+    pct = (size_mb / MAX_FREE_QUOTA_MB) * 100
+    thor_text = f"<code>{thor_rate:.5f}%</code>" if thor_rate is not None else "N/A"
+    thor_1m_text = f"<code>{thor_1m:.5f}%</code>" if thor_1m is not None else "N/A"
+    thor_disp_date = thor_date or latest_date
+
+    message = (
+        f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>EOD Data สำหรับวันเทรด {latest_date} ถูกดึงลง Turso เรียบร้อยแล้ว</b>\n\n"
+        f"<b>📦 รายการข้อมูลที่จัดเก็บ ({latest_date}):</b>\n"
+        f"• <b>Futures Series</b>: <code>{fut_cnt}</code> สัญญา (Active Series)\n"
+        f"• <b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P)\n"
+        f"• <b>Investor Types</b>: <code>{inv_cnt}</code> กลุ่ม (Futures, Calls, Puts)\n"
+        f"• <b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า\n\n"
+        f"<b>📈 ดอกเบี้ยอ้างอิง BOT THOR ({thor_disp_date}):</b>\n"
+        f"• <b>THOR Overnight</b>: {thor_text}\n"
+        f"• <b>THOR 1M Average</b>: {thor_1m_text}\n\n"
+        f"<b>💾 Turso Database Status:</b>\n"
+        f"• <b>Storage Usage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code> - Healthy\n"
+        f"• <b>Notified At</b>: <code>{now_bkk_str}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    # 5. Dispatch Message via Telegram Bot API
+    tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        resp = requests.post(tg_url, json=payload, timeout=15)
+        if resp.status_code != 200:
+            print(f"[TELEGRAM] Warning: Telegram API failed ({resp.status_code}): {resp.text}")
+            return False
+        print(f"[TELEGRAM] Notification dispatched successfully to chat_id {chat_id} for trade date {latest_date}.")
+    except Exception as e:
+        print(f"[TELEGRAM] Error sending Telegram message: {e}")
+        return False
+
+    # 6. Record Notification in eod_telegram_log
+    snippet = f"EOD {latest_date} completed (F:{fut_cnt}, O:{opt_cnt}, I:{inv_cnt})"
+    sql_log = "INSERT OR REPLACE INTO eod_telegram_log (trade_date, notified_at_bkk, message_snippet) VALUES (?, ?, ?);"
+
+    if is_turso:
+        log_stmt = [{
+            "type": "execute",
+            "stmt": {
+                "sql": sql_log,
+                "args": [
+                    {"type": "text", "value": latest_date},
+                    {"type": "text", "value": now_bkk_str},
+                    {"type": "text", "value": snippet}
+                ]
+            }
+        }, {"type": "close"}]
+        try:
+            requests.post(pipeline_url, headers=headers, json={"requests": log_stmt}, timeout=15)
+            print(f"[TELEGRAM] Recorded trade_date {latest_date} in eod_telegram_log.")
+        except Exception as e:
+            print(f"[TELEGRAM] Warning: Failed to record notification log in Turso: {e}")
+    else:
+        try:
+            conn = sqlite3.connect(target_db)
+            cur = conn.cursor()
+            cur.execute(sql_log, (latest_date, now_bkk_str, snippet))
+            conn.commit()
+            conn.close()
+            print(f"[TELEGRAM] Recorded trade_date {latest_date} in eod_telegram_log.")
+        except Exception as e:
+            print(f"[TELEGRAM] Warning: Failed to record notification log in local SQLite: {e}")
+
+    return True
+
+# ==============================================================================
 # MAIN ORCHESTRATOR
 # ==============================================================================
 
@@ -1030,6 +1281,11 @@ def main():
         "--force",
         action="store_true",
         help="Force execution regardless of weekend or official SET holidays"
+    )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Force send Telegram completion alert regardless of time window or prior notification"
     )
     parser.add_argument(
         "--local-db",
@@ -1054,11 +1310,11 @@ def main():
     is_holiday, reason = is_holiday_or_weekend(now_bkk)
     if is_holiday:
         print(f"[GUARD] {reason}.")
-        if not args.force:
-            print("[GUARD] Skipping execution. (Use --force to run anyway).")
+        if not (args.force or args.notify):
+            print("[GUARD] Skipping execution. (Use --force or --notify to run anyway).")
             sys.exit(0)
         else:
-            print("[GUARD] --force flag detected. Proceeding with execution.")
+            print("[GUARD] Override flag detected (--force / --notify). Proceeding with execution.")
     else:
         print(f"[GUARD] Check passed: {reason}.")
 
@@ -1116,6 +1372,30 @@ def main():
     else:
         db_file = args.local_db or "eod_tfex.db"
         run_fifo_retention_guard(db_file=db_file)
+
+    # 7. Automated Telegram EOD Completion Alert
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if bot_token and chat_id:
+        if turso_url and turso_token:
+            pipeline_url = normalize_turso_url(turso_url)
+            send_eod_telegram_alert(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                pipeline_url=pipeline_url,
+                auth_token=turso_token,
+                force_notify=args.notify
+            )
+        else:
+            db_file = args.local_db or "eod_tfex.db"
+            send_eod_telegram_alert(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                db_file=db_file,
+                force_notify=args.notify
+            )
+    else:
+        print("[TELEGRAM] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. Skipping alert.")
 
     print("=" * 70)
     print("SUCCESS: Stateless EOD Data Collection completed idempotently.")
