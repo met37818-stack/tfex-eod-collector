@@ -4,7 +4,7 @@ Stateless Python EOD Data Collector สำหรับดึงข้อมู�
 
 ---
 
-## 1. ข้อมูลทั้ง 5 ส่วนที่จัดเก็บ (Database Schema)
+## 1. ข้อมูลทั้ง 6 ส่วนที่จัดเก็บ (Database Schema)
 
 | ตาราง | แหล่งข้อมูล | Primary Key | คำอธิบาย |
 |---|---|---|---|
@@ -13,6 +13,7 @@ Stateless Python EOD Data Collector สำหรับดึงข้อมู�
 | `eod_futures_series` | TFEX Series Trading (JSON API) | `(trade_date, series)` | ข้อมูลซื้อขาย 5 วันล่าสุดของ 2 Active Quarterly Series (เช่น `S50Z26`, `S50H27`) |
 | `eod_options_series` | TFEX Options Series (JSON API) | `(trade_date, symbol)` | ข้อมูลซื้อขาย 5 วันล่าสุดของทุกสัญญา Options ของ 2 Active Series (ดึงคู่ขนานด้วย 8 Workers) |
 | `eod_thor_rates` | BOT THOR Rates (HTML Form) | `(trade_date)` | อัตราดอกเบี้ย THOR ย้อนหลัง 30 วัน (`thor_rate`, `thor_1m_avg`, `thor_3m_avg`, `thor_6m_avg`) |
+| `eod_options_greeks` | Black-76 Greeks Engine (`greeks_engine.py`) | `(trade_date, symbol)` | ค่ากรีกครบถ้วน First & Second Order (`iv`, `delta`, `gamma`, `theta`, `vega`, `vanna`, `charm`) คำนวณจากราคา Settlement/Close และดอกเบี้ย THOR |
 
 > **หมายเหตุเรื่องความถูกต้องของวันที่ (Date Invariant):** ข้อมูลทุกตารางใช้ `trade_date` จริงที่ติดมากับข้อมูล (แปลงเป็น `YYYY-MM-DD`) ห้ามใช้วันที่ของนาฬิกาเครื่อง เพื่อรองรับรอบการรันข้ามคืน (ตี 1 และ 6 โมงเช้า)
 

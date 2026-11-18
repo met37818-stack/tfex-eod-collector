@@ -636,6 +636,28 @@ DDL_STATEMENTS = [
         notified_at_bkk TEXT NOT NULL,
         message_snippet TEXT
     );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS eod_options_greeks (
+        trade_date TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        series TEXT NOT NULL,
+        option_type TEXT NOT NULL,
+        strike REAL NOT NULL,
+        underlying_futures TEXT NOT NULL,
+        dte INTEGER NOT NULL,
+        thor_rate REAL,
+        iv REAL,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL,
+        vanna REAL,
+        charm REAL,
+        open_interest INTEGER,
+        updated_at_bkk TEXT,
+        PRIMARY KEY (trade_date, symbol)
+    );
     """
 ]
 
@@ -1354,6 +1376,16 @@ def main():
         db_file = args.local_db or "eod_tfex.db"
         print(f"[DATABASE] No Turso credentials found. Using local SQLite database: {db_file}")
         execute_sqlite_local(db_file, statements)
+
+    # 5.1 EOD Black-76 Full Greeks Calculation Pipeline
+    try:
+        from greeks_engine import run_eod_greeks_pipeline
+        if turso_url and turso_token:
+            run_eod_greeks_pipeline(pipeline_url=pipeline_url, auth_token=turso_token)
+        else:
+            run_eod_greeks_pipeline(db_file=db_file)
+    except Exception as e:
+        print(f"[GREEKS] Error running EOD Greeks pipeline: {e}")
 
     # Summary Audit
     print("=" * 70)
