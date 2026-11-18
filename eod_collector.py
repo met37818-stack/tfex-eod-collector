@@ -1104,6 +1104,8 @@ def send_eod_telegram_alert(
     mkt_cnt = 0
     thor_rate = None
     thor_1m = None
+    thor_3m = None
+    thor_6m = None
     thor_date = None
     size_mb = 0.0
 
@@ -1114,7 +1116,7 @@ def send_eod_telegram_alert(
         }
         reqs1 = [
             {"type": "execute", "stmt": {"sql": "SELECT MAX(trade_date) FROM eod_futures_series;"}},
-            {"type": "execute", "stmt": {"sql": "SELECT trade_date, thor_rate, thor_1m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"}},
+            {"type": "execute", "stmt": {"sql": "SELECT trade_date, thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"}},
             {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
             {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
             {"type": "close"}
@@ -1129,9 +1131,12 @@ def send_eod_telegram_alert(
 
                 rows1 = res1["results"][1]["response"]["result"]["rows"]
                 if rows1:
-                    thor_date = rows1[0][0]["value"]
-                    thor_rate = clean_float(rows1[0][1]["value"])
-                    thor_1m = clean_float(rows1[0][2]["value"])
+                    r_val = rows1[0]
+                    thor_date = r_val[0]["value"]
+                    thor_rate = clean_float(r_val[1]["value"]) if len(r_val) > 1 else None
+                    thor_1m = clean_float(r_val[2]["value"]) if len(r_val) > 2 else None
+                    thor_3m = clean_float(r_val[3]["value"]) if len(r_val) > 3 else None
+                    thor_6m = clean_float(r_val[4]["value"]) if len(r_val) > 4 else None
 
                 pc = int(res1["results"][2]["response"]["result"]["rows"][0][0]["value"])
                 ps = int(res1["results"][3]["response"]["result"]["rows"][0][0]["value"])
@@ -1197,10 +1202,14 @@ def send_eod_telegram_alert(
             cur.execute("SELECT COUNT(*) FROM eod_market_stats WHERE trade_date = ?;", (latest_date,))
             mkt_cnt = cur.fetchone()[0]
 
-            cur.execute("SELECT trade_date, thor_rate, thor_1m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;")
+            cur.execute("SELECT trade_date, thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;")
             t_row = cur.fetchone()
             if t_row:
-                thor_date, thor_rate, thor_1m = t_row[0], clean_float(t_row[1]), clean_float(t_row[2])
+                thor_date = t_row[0]
+                thor_rate = clean_float(t_row[1]) if len(t_row) > 1 else None
+                thor_1m = clean_float(t_row[2]) if len(t_row) > 2 else None
+                thor_3m = clean_float(t_row[3]) if len(t_row) > 3 else None
+                thor_6m = clean_float(t_row[4]) if len(t_row) > 4 else None
 
             cur.execute("PRAGMA page_count;")
             pc = cur.fetchone()[0]
@@ -1221,6 +1230,8 @@ def send_eod_telegram_alert(
     pct = (size_mb / MAX_FREE_QUOTA_MB) * 100
     thor_text = f"<code>{thor_rate:.5f}%</code>" if thor_rate is not None else "N/A"
     thor_1m_text = f"<code>{thor_1m:.5f}%</code>" if thor_1m is not None else "N/A"
+    thor_3m_text = f"<code>{thor_3m:.5f}%</code>" if thor_3m is not None else "N/A"
+    thor_6m_text = f"<code>{thor_6m:.5f}%</code>" if thor_6m is not None else "N/A"
     thor_disp_date = thor_date or latest_date
 
     message = (
@@ -1234,7 +1245,9 @@ def send_eod_telegram_alert(
         f"• <b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า\n\n"
         f"<b>📈 ดอกเบี้ยอ้างอิง BOT THOR ({thor_disp_date}):</b>\n"
         f"• <b>THOR Overnight</b>: {thor_text}\n"
-        f"• <b>THOR 1M Average</b>: {thor_1m_text}\n\n"
+        f"• <b>THOR 1M Average</b>: {thor_1m_text}\n"
+        f"• <b>THOR 3M Average</b>: {thor_3m_text}\n"
+        f"• <b>THOR 6M Average</b>: {thor_6m_text}\n\n"
         f"<b>💾 Turso Database Status:</b>\n"
         f"• <b>Storage Usage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code> - Healthy\n"
         f"• <b>Notified At</b>: <code>{now_bkk_str}</code>\n"

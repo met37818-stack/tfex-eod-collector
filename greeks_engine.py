@@ -223,11 +223,58 @@ CREATE TABLE IF NOT EXISTS eod_options_greeks (
 # 4. GREEKS PROCESSING ENGINE
 # ==============================================================================
 
+def select_dynamic_thor_rate(
+    thor_record: Dict[str, Optional[float]],
+    dte: int
+) -> Tuple[float, str]:
+    """
+    Selects dynamic THOR rate matching the option's DTE (Days to Expiration).
+    
+    Tenor Selection Rules:
+    - dte <= 30 days:
+        Prefer 1M Compounded ('1m')
+        Fallback: Overnight ('overnight')
+    - 30 < dte <= 90 days:
+        Prefer 3M Compounded ('3m')
+        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
+    - 90 < dte <= 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
+    - dte > 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded -> Overnight
+    """
+    def _clean(val: Optional[float]) -> Optional[float]:
+        if val is None or val <= 0:
+            return None
+        return val / 100.0 if val > 0.5 else val
+
+    r_on = _clean(thor_record.get("overnight"))
+    r_1m = _clean(thor_record.get("1m"))
+    r_3m = _clean(thor_record.get("3m"))
+    r_6m = _clean(thor_record.get("6m"))
+
+    if dte <= 30:
+        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
+    elif dte <= 90:
+        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
+    elif dte <= 180:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
+    else:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
+
+    for label, rate in candidates:
+        if rate is not None and rate > 0:
+            return rate, label
+
+    return 0.015, "DEFAULT"
+
+
 def compute_greeks_records_for_date(
     trade_date: str,
     options_rows: List[Dict[str, Any]],
     futures_dict: Dict[str, float],
-    thor_rate: float,
+    thor_rate: Any,
     now_bkk_str: str
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     """
@@ -267,6 +314,14 @@ def compute_greeks_records_for_date(
         dte = max(0, (expiry_date - trade_date_obj).days)
         T_years = max(dte, 0.5) / 365.0
 
+        # Dynamic contract-specific THOR rate
+        if isinstance(thor_rate, dict):
+            contract_thor, _ = select_dynamic_thor_rate(thor_rate, dte)
+        elif isinstance(thor_rate, (int, float)):
+            contract_thor = float(thor_rate)
+        else:
+            contract_thor = 0.015
+
         # Option pricing reference: settlement_price preferred, close fallback
         opt_price = opt.get("settlement_price")
         if opt_price is None or opt_price <= 0:
@@ -274,11 +329,11 @@ def compute_greeks_records_for_date(
 
         iv = None
         if opt_price and opt_price > 0:
-            iv = calculate_implied_vol(opt_price, f_price, strike, T_years, thor_rate, opt_type)
+            iv = calculate_implied_vol(opt_price, f_price, strike, T_years, contract_thor, opt_type)
 
         if iv is not None and iv > 0.0001:
             try:
-                g = calculate_black76_full_greeks(f_price, strike, T_years, thor_rate, iv, opt_type)
+                g = calculate_black76_full_greeks(f_price, strike, T_years, contract_thor, iv, opt_type)
                 greeks_records.append({
                     "trade_date": trade_date,
                     "symbol": symbol,
@@ -287,7 +342,7 @@ def compute_greeks_records_for_date(
                     "strike": strike,
                     "underlying_futures": underlying,
                     "dte": dte,
-                    "thor_rate": thor_rate,
+                    "thor_rate": round(contract_thor, 6),
                     "iv": round(iv, 6),
                     "delta": round(g["delta"], 6),
                     "gamma": round(g["gamma"], 6),
@@ -303,7 +358,7 @@ def compute_greeks_records_for_date(
                 greeks_records.append({
                     "trade_date": trade_date, "symbol": symbol, "series": series,
                     "option_type": opt_type, "strike": strike, "underlying_futures": underlying,
-                    "dte": dte, "thor_rate": thor_rate, "iv": None, "delta": None,
+                    "dte": dte, "thor_rate": round(contract_thor, 6), "iv": None, "delta": None,
                     "gamma": None, "theta": None, "vega": None, "vanna": None,
                     "charm": None, "open_interest": oi, "updated_at_bkk": now_bkk_str
                 })
@@ -318,7 +373,7 @@ def compute_greeks_records_for_date(
                 "strike": strike,
                 "underlying_futures": underlying,
                 "dte": dte,
-                "thor_rate": thor_rate,
+                "thor_rate": round(contract_thor, 6),
                 "iv": None,
                 "delta": None,
                 "gamma": None,
@@ -416,12 +471,12 @@ def run_eod_greeks_pipeline(
         # 2. Query Data for this date
         options_rows = []
         futures_dict = {}
-        thor_rate = 0.02  # Fallback only if no records at all
+        thor_dict = {"overnight": 0.02, "1m": None, "3m": None, "6m": None}
 
         if is_turso:
             sql_opt = "SELECT symbol, series, option_type, strike, settlement_price, close, oi FROM eod_options_series WHERE trade_date = ?;"
             sql_fut = "SELECT series, settlement_price, close FROM eod_futures_series WHERE trade_date = ?;"
-            sql_thor = "SELECT thor_rate FROM eod_thor_rates WHERE trade_date <= ? AND thor_rate IS NOT NULL AND thor_rate > 0 ORDER BY trade_date DESC LIMIT 1;"
+            sql_thor = "SELECT thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates WHERE trade_date <= ? AND thor_rate IS NOT NULL AND thor_rate > 0 ORDER BY trade_date DESC LIMIT 1;"
 
             reqs = [
                 {"type": "execute", "stmt": {"sql": sql_opt, "args": [{"type": "text", "value": t_date}]}},
@@ -459,9 +514,12 @@ def run_eod_greeks_pipeline(
                         futures_dict[f"S50{f_ser}"] = ref_p
             # Parse thor
             thor_raw = res[2].get("response", {}).get("result", {}).get("rows", [])
-            if thor_raw and thor_raw[0] and thor_raw[0][0].get("value") is not None:
-                tr_val = float(thor_raw[0][0].get("value"))
-                thor_rate = tr_val / 100.0 if tr_val > 0.5 else tr_val
+            if thor_raw and thor_raw[0]:
+                r_thor = thor_raw[0]
+                thor_dict["overnight"] = float(r_thor[0].get("value")) if len(r_thor) > 0 and r_thor[0].get("value") is not None else None
+                thor_dict["1m"] = float(r_thor[1].get("value")) if len(r_thor) > 1 and r_thor[1].get("value") is not None else None
+                thor_dict["3m"] = float(r_thor[2].get("value")) if len(r_thor) > 2 and r_thor[2].get("value") is not None else None
+                thor_dict["6m"] = float(r_thor[3].get("value")) if len(r_thor) > 3 and r_thor[3].get("value") is not None else None
         else:
             conn = sqlite3.connect(target_db)
             cur = conn.cursor()
@@ -479,23 +537,25 @@ def run_eod_greeks_pipeline(
                     futures_dict[f_ser] = ref_p
                     if not f_ser.startswith("S50"):
                         futures_dict[f"S50{f_ser}"] = ref_p
-            cur.execute("SELECT thor_rate FROM eod_thor_rates WHERE trade_date <= ? AND thor_rate IS NOT NULL AND thor_rate > 0 ORDER BY trade_date DESC LIMIT 1;", (t_date,))
+            cur.execute("SELECT thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates WHERE trade_date <= ? AND thor_rate IS NOT NULL AND thor_rate > 0 ORDER BY trade_date DESC LIMIT 1;", (t_date,))
             tr_row = cur.fetchone()
-            if tr_row and tr_row[0]:
-                tr_val = float(tr_row[0])
-                thor_rate = tr_val / 100.0 if tr_val > 0.5 else tr_val
+            if tr_row:
+                thor_dict["overnight"] = float(tr_row[0]) if len(tr_row) > 0 and tr_row[0] is not None else None
+                thor_dict["1m"] = float(tr_row[1]) if len(tr_row) > 1 and tr_row[1] is not None else None
+                thor_dict["3m"] = float(tr_row[2]) if len(tr_row) > 2 and tr_row[2] is not None else None
+                thor_dict["6m"] = float(tr_row[3]) if len(tr_row) > 3 and tr_row[3] is not None else None
             conn.close()
 
         if not options_rows:
             print(f"[GREEKS] No options rows found for {t_date}.")
             continue
 
-        print(f"[GREEKS] Computing Greeks for {len(options_rows)} options | Futures Ref: {futures_dict} | THOR: {thor_rate*100.0:.2f}%")
+        print(f"[GREEKS] Computing Greeks for {len(options_rows)} options | Futures Ref: {futures_dict} | Dynamic THOR Rates: {thor_dict}")
         greeks_recs, v_cnt, inv_cnt = compute_greeks_records_for_date(
             trade_date=t_date,
             options_rows=options_rows,
             futures_dict=futures_dict,
-            thor_rate=thor_rate,
+            thor_rate=thor_dict,
             now_bkk_str=now_bkk_str
         )
         total_valid += v_cnt
