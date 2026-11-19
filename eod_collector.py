@@ -23,6 +23,7 @@ import datetime
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sqlite3
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -852,209 +853,162 @@ def build_upsert_statements(
     return statements
 
 # ==============================================================================
-# FIFO INTRADAY RETENTION & STORAGE GUARD
+# TIERED INTRADAY RETENTION & STORAGE MAINTENANCE GUARD
 # ==============================================================================
 
 MAX_FREE_QUOTA_MB = 5120.0       # 5.0 GB free quota
-TRIGGER_THRESHOLD_MB = 4096.0    # 4.0 GB (80% trigger threshold)
-MIN_RETENTION_DAYS = 365         # Strict 1-year safety lock
-PRUNE_CHUNK_DAYS = 7             # Purge 1 week per cycle
+RETENTION_OPTIONS_DAYS = 14      # Tier 1: options_snapshots (14 days)
+RETENTION_FUTURES_SPOT_DAYS = 90 # Tier 2: futures_snapshots & spot_snapshots (90 days)
+# Tier 3: eod_* tables and daily_realized_vol are STRICTLY PERMANENT (never deleted)
 INTRADAY_TABLES = [
     "spot_snapshots",
     "futures_snapshots",
     "options_snapshots"
 ]
 
-def run_fifo_retention_guard(pipeline_url: str = None, auth_token: str = None, db_file: str = None):
+def run_tiered_retention_guard(
+    pipeline_url: str = None,
+    auth_token: str = None,
+    db_file: str = None,
+    ref_date: Optional[datetime.date] = None
+) -> Dict[str, Any]:
     """
-    Automated FIFO Intraday Retention Guard.
-    1. Inspects current DB size via PRAGMA page_count and page_size.
-    2. Logs storage health relative to 5.0 GB (5,120 MB) quota.
-    3. If size exceeds 4.0 GB (4,096 MB / 80%):
-       - Searches oldest date across spot_snapshots, futures_snapshots, options_snapshots.
-       - Enforces Safety Lock: Must be at least 365 days old (never delete recent data).
-       - Deletes oldest data in 7-day chunks from intraday tables.
-       - Reclaims space and logs updated size.
-    * Note: eod_* tables are strictly untouched and preserved indefinitely.
+    Tiered Retention Policy Guard for Turso & SQLite:
+    1. options_snapshots (Tier 1): Retain 14 days; delete rows where captured_at_bkk < date('now', '-14 days').
+    2. futures_snapshots & spot_snapshots (Tier 2): Retain 90 days; delete rows where captured_at_bkk < date('now', '-90 days').
+    3. All eod_* tables & daily_realized_vol (Tier 3): STRICTLY PERMANENT; never deleted.
+    Returns dictionary with deleted rows count per table and cutoff timestamps.
     """
     now_bkk = datetime.datetime.now(BKK_TZ)
-    current_date = now_bkk.date()
+    base_date = ref_date or now_bkk.date()
 
-    page_count = 0
-    page_size = 4096
+    cutoff_options_date = base_date - datetime.timedelta(days=RETENTION_OPTIONS_DAYS)
+    cutoff_futures_spot_date = base_date - datetime.timedelta(days=RETENTION_FUTURES_SPOT_DAYS)
+
+    cutoff_options_str = cutoff_options_date.strftime("%Y-%m-%d 00:00:00")
+    cutoff_futures_spot_str = cutoff_futures_spot_date.strftime("%Y-%m-%d 00:00:00")
+
+    deleted_counts = {
+        "options_snapshots": 0,
+        "futures_snapshots": 0,
+        "spot_snapshots": 0,
+        "cutoff_options": cutoff_options_str,
+        "cutoff_futures_spot": cutoff_futures_spot_str
+    }
+
     is_turso = bool(pipeline_url and auth_token)
+
+    print("=" * 70)
+    print("TIERED RETENTION & STORAGE MAINTENANCE AUDIT")
+    print("=" * 70)
+    print(f"[RETENTION] Base Evaluation Date: {base_date}")
+    print(f"[RETENTION] Tier 1 (options_snapshots): 14 days (Cutoff: < {cutoff_options_str})")
+    print(f"[RETENTION] Tier 2 (futures/spot):      90 days (Cutoff: < {cutoff_futures_spot_str})")
+    print(f"[RETENTION] Tier 3 (eod_* & daily_rv):   PERMANENT (Strictly untouched)")
 
     if is_turso:
         headers = {
             "Authorization": f"Bearer {auth_token}",
             "Content-Type": "application/json"
         }
-        reqs = [
+        cnt_reqs = [
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
+            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
+            {"type": "close"}
+        ]
+        try:
+            r_cnt = requests.post(pipeline_url, headers=headers, json={"requests": cnt_reqs}, timeout=20)
+            if r_cnt.status_code == 200:
+                res = r_cnt.json()
+                results = res.get("results", [])
+                if len(results) >= 1 and results[0].get("type") == "ok":
+                    rows = results[0]["response"]["result"]["rows"]
+                    if rows and rows[0][0]["type"] != "null":
+                        deleted_counts["options_snapshots"] = int(rows[0][0]["value"])
+                if len(results) >= 2 and results[1].get("type") == "ok":
+                    rows = results[1]["response"]["result"]["rows"]
+                    if rows and rows[0][0]["type"] != "null":
+                        deleted_counts["futures_snapshots"] = int(rows[0][0]["value"])
+                if len(results) >= 3 and results[2].get("type") == "ok":
+                    rows = results[2]["response"]["result"]["rows"]
+                    if rows and rows[0][0]["type"] != "null":
+                        deleted_counts["spot_snapshots"] = int(rows[0][0]["value"])
+        except Exception as e:
+            print(f"[RETENTION] Warning: Failed to pre-count rows in Turso: {e}")
+
+        del_reqs = [
+            {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
+            {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
+            {"type": "execute", "stmt": {"sql": "DELETE FROM spot_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
             {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
             {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
             {"type": "close"}
         ]
         try:
-            r = requests.post(pipeline_url, headers=headers, json={"requests": reqs}, timeout=20)
-            if r.status_code == 200:
-                res = r.json()
-                page_count = int(res["results"][0]["response"]["result"]["rows"][0][0]["value"])
-                page_size = int(res["results"][1]["response"]["result"]["rows"][0][0]["value"])
+            r_del = requests.post(pipeline_url, headers=headers, json={"requests": del_reqs}, timeout=30)
+            if r_del.status_code == 200:
+                res_del = r_del.json()
+                results = res_del.get("results", [])
+                if len(results) >= 5:
+                    pc_res = results[3]
+                    ps_res = results[4]
+                    if pc_res.get("type") == "ok" and ps_res.get("type") == "ok":
+                        pc = int(pc_res["response"]["result"]["rows"][0][0]["value"])
+                        ps = int(ps_res["response"]["result"]["rows"][0][0]["value"])
+                        new_mb = (pc * ps) / (1024 * 1024)
+                        print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
         except Exception as e:
-            print(f"[STORAGE GUARD] Warning: Failed to query Turso PRAGMA: {e}")
-            return
+            print(f"[RETENTION] Error executing Turso tiered retention delete: {e}")
     else:
         target_db = db_file or "eod_tfex.db"
-        if not os.path.exists(target_db):
-            return
-        try:
-            conn = sqlite3.connect(target_db)
-            cur = conn.cursor()
-            cur.execute("PRAGMA page_count;")
-            page_count = cur.fetchone()[0]
-            cur.execute("PRAGMA page_size;")
-            page_size = cur.fetchone()[0]
-            conn.close()
-        except Exception as e:
-            print(f"[STORAGE GUARD] Warning: Failed to query local SQLite PRAGMA: {e}")
-            return
-
-    db_bytes = page_count * page_size
-    db_mb = db_bytes / (1024 * 1024)
-    usage_pct = (db_mb / MAX_FREE_QUOTA_MB) * 100
-    status_label = "Healthy" if db_mb < TRIGGER_THRESHOLD_MB else "Action Required (> 80%)"
-
-    print("=" * 70)
-    print("STORAGE MANAGEMENT & RETENTION AUDIT")
-    print("=" * 70)
-    print(f"[STORAGE GUARD] Current DB Size: {db_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({usage_pct:.2f}%) - {status_label}")
-
-    if db_mb < TRIGGER_THRESHOLD_MB:
-        print("[STORAGE GUARD] Storage within healthy limit (< 80%). No retention purging needed.")
-        return
-
-    # Trigger threshold exceeded!
-    print(f"[STORAGE GUARD] WARNING: DB Size ({db_mb:.2f} MB) exceeds 80% threshold ({TRIGGER_THRESHOLD_MB:.0f} MB).")
-    print("[STORAGE GUARD] Evaluating FIFO Intraday Retention for spot, futures, and options snapshots...")
-
-    oldest_dates = []
-
-    if is_turso:
-        reqs = []
-        for tbl in INTRADAY_TABLES:
-            reqs.append({"type": "execute", "stmt": {"sql": f"SELECT MIN(captured_at_bkk) FROM {tbl};"}})
-        reqs.append({"type": "close"})
-
-        try:
-            r = requests.post(pipeline_url, headers=headers, json={"requests": reqs}, timeout=20)
-            if r.status_code == 200:
-                res = r.json()
-                for idx, tbl in enumerate(INTRADAY_TABLES):
-                    result_item = res["results"][idx]
-                    if result_item.get("type") == "ok":
-                        rows = result_item["response"]["result"]["rows"]
-                        if rows and rows[0][0]["type"] != "null":
-                            val = rows[0][0]["value"]
-                            if val:
-                                oldest_dates.append((val[:10], tbl))
-        except Exception as e:
-            print(f"[STORAGE GUARD] Error checking intraday timestamps: {e}")
-            return
-    else:
-        try:
-            conn = sqlite3.connect(target_db)
-            cur = conn.cursor()
-            for tbl in INTRADAY_TABLES:
-                cur.execute(f"SELECT MIN(captured_at_bkk) FROM {tbl};")
-                row = cur.fetchone()
-                if row and row[0]:
-                    oldest_dates.append((str(row[0])[:10], tbl))
-            conn.close()
-        except Exception as e:
-            print(f"[STORAGE GUARD] Error checking local intraday timestamps: {e}")
-            return
-
-    if not oldest_dates:
-        print("[STORAGE GUARD] Intraday snapshot tables are empty or uninitialized. Skipping.")
-        return
-
-    oldest_dates.sort(key=lambda x: x[0])
-    oldest_date_str = oldest_dates[0][0]
-
-    try:
-        oldest_date = datetime.datetime.strptime(oldest_date_str, "%Y-%m-%d").date()
-    except Exception as e:
-        print(f"[STORAGE GUARD] Error parsing oldest date '{oldest_date_str}': {e}")
-        return
-
-    age_days = (current_date - oldest_date).days
-
-    # Safety Lock: MUST be at least 365 days old
-    if age_days < MIN_RETENTION_DAYS:
-        print(f"[STORAGE GUARD] SAFETY LOCK ENGAGED: Oldest intraday record ({oldest_date_str}) is only {age_days} days old (< {MIN_RETENTION_DAYS} days).")
-        print("[STORAGE GUARD] All intraday data within 1 year is strictly protected. Zero records deleted.")
-        return
-
-    # FIFO Pruning: Purge 7 days from oldest date
-    cutoff_date = oldest_date + datetime.timedelta(days=PRUNE_CHUNK_DAYS)
-    cutoff_str = cutoff_date.strftime("%Y-%m-%d 23:59:59")
-    print(f"[STORAGE GUARD] FIFO Pruning: Purging 7 days of historical intraday data (from {oldest_date_str} up to {cutoff_date})...")
-
-    if is_turso:
-        purge_reqs = []
-        for tbl in INTRADAY_TABLES:
-            purge_reqs.append({
-                "type": "execute",
-                "stmt": {
-                    "sql": f"DELETE FROM {tbl} WHERE captured_at_bkk <= ?;",
-                    "args": [{"type": "text", "value": cutoff_str}]
-                }
-            })
-        purge_reqs.append({"type": "close"})
-
-        try:
-            r = requests.post(pipeline_url, headers=headers, json={"requests": purge_reqs}, timeout=30)
-            if r.status_code == 200:
-                print(f"[STORAGE GUARD] Successfully purged intraday records up to {cutoff_str}.")
-        except Exception as e:
-            print(f"[STORAGE GUARD] Error during purge: {e}")
-            return
-
-        check_reqs = [
-            {"type": "execute", "stmt": {"sql": "PRAGMA page_count;"}},
-            {"type": "execute", "stmt": {"sql": "PRAGMA page_size;"}},
-            {"type": "close"}
-        ]
-        try:
-            r = requests.post(pipeline_url, headers=headers, json={"requests": check_reqs}, timeout=20)
-            if r.status_code == 200:
-                res = r.json()
-                new_pc = int(res["results"][0]["response"]["result"]["rows"][0][0]["value"])
-                new_ps = int(res["results"][1]["response"]["result"]["rows"][0][0]["value"])
-                new_mb = (new_pc * new_ps) / (1024 * 1024)
-                print(f"[STORAGE GUARD] Post-cleanup DB Size: {new_mb:.2f} MB (Reclaimed: {db_mb - new_mb:.2f} MB)")
-        except Exception:
-            pass
-    else:
-        try:
-            conn = sqlite3.connect(target_db)
-            cur = conn.cursor()
-            for tbl in INTRADAY_TABLES:
-                cur.execute(f"DELETE FROM {tbl} WHERE captured_at_bkk <= ?;", (cutoff_str,))
-            conn.commit()
+        if os.path.exists(target_db):
             try:
-                cur.execute("VACUUM;")
-            except Exception:
-                pass
-            cur.execute("PRAGMA page_count;")
-            new_pc = cur.fetchone()[0]
-            cur.execute("PRAGMA page_size;")
-            new_ps = cur.fetchone()[0]
-            conn.close()
-            new_mb = (new_pc * new_ps) / (1024 * 1024)
-            print(f"[STORAGE GUARD] Post-cleanup DB Size: {new_mb:.2f} MB (Reclaimed: {db_mb - new_mb:.2f} MB)")
-        except Exception as e:
-            print(f"[STORAGE GUARD] Error during local purge/vacuum: {e}")
+                conn = sqlite3.connect(target_db)
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                existing_tables = set(row[0] for row in cur.fetchall())
+
+                if "options_snapshots" in existing_tables:
+                    cur.execute("SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
+                    deleted_counts["options_snapshots"] = cur.fetchone()[0]
+                    cur.execute("DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
+
+                if "futures_snapshots" in existing_tables:
+                    cur.execute("SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+                    deleted_counts["futures_snapshots"] = cur.fetchone()[0]
+                    cur.execute("DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+
+                if "spot_snapshots" in existing_tables:
+                    cur.execute("SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+                    deleted_counts["spot_snapshots"] = cur.fetchone()[0]
+                    cur.execute("DELETE FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+
+                conn.commit()
+                try:
+                    cur.execute("VACUUM;")
+                except Exception:
+                    pass
+                cur.execute("PRAGMA page_count;")
+                pc = cur.fetchone()[0]
+                cur.execute("PRAGMA page_size;")
+                ps = cur.fetchone()[0]
+                conn.close()
+                new_mb = (pc * ps) / (1024 * 1024)
+                print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
+            except Exception as e:
+                print(f"[RETENTION] Error executing local SQLite tiered retention delete: {e}")
+
+    print(f"[RETENTION] Summary of purged records:")
+    print(f"  • options_snapshots (14d limit): {deleted_counts['options_snapshots']:,} rows deleted")
+    print(f"  • futures_snapshots (90d limit): {deleted_counts['futures_snapshots']:,} rows deleted")
+    print(f"  • spot_snapshots    (90d limit): {deleted_counts['spot_snapshots']:,} rows deleted")
+    print(f"  • eod_* & daily_realized_vol:    0 rows deleted (Strict Permanent Protection)")
+    return deleted_counts
+
+
+# Backward compatibility alias
+run_fifo_retention_guard = run_tiered_retention_guard
 
 # ==============================================================================
 # TELEGRAM EOD COMPLETION NOTIFIER
@@ -1067,7 +1021,8 @@ def send_eod_telegram_alert(
     auth_token: str = None,
     db_file: str = None,
     force_notify: bool = False,
-    scrape_failed_count: int = 0
+    scrape_failed_count: int = 0,
+    retention_stats: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
     Sends EOD data collection summary alert to Telegram on Mon-Fri morning (05:30 - 07:30 ICT).
@@ -1238,6 +1193,19 @@ def send_eod_telegram_alert(
     thor_6m_text = f"<code>{thor_6m:.5f}%</code>" if thor_6m is not None else "N/A"
     thor_disp_date = thor_date or latest_date
 
+    ret_text = ""
+    if retention_stats:
+        opt_del = retention_stats.get("options_snapshots", 0)
+        fut_del = retention_stats.get("futures_snapshots", 0)
+        spt_del = retention_stats.get("spot_snapshots", 0)
+        ret_text = (
+            f"\n\n<b>🧹 Tiered Retention Maintenance:</b>\n"
+            f"• <b>options_snapshots (14d)</b>: <code>{opt_del:,}</code> แถวถูกลบ\n"
+            f"• <b>futures_snapshots (90d)</b>: <code>{fut_del:,}</code> แถวถูกลบ\n"
+            f"• <b>spot_snapshots (90d)</b>: <code>{spt_del:,}</code> แถวถูกลบ\n"
+            f"• <b>eod_* & daily_realized_vol</b>: <code>ถาวร (ห้ามลบ)</code>"
+        )
+
     opt_fail_text = f" ⚠️ <i>(ดึงไม่สำเร็จ {scrape_failed_count} สัญญา)</i>" if scrape_failed_count > 0 else ""
     message = (
         f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
@@ -1255,7 +1223,8 @@ def send_eod_telegram_alert(
         f"• <b>THOR 6M Average</b>: {thor_6m_text}\n\n"
         f"<b>💾 Turso Database Status:</b>\n"
         f"• <b>Storage Usage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code> - Healthy\n"
-        f"• <b>Notified At</b>: <code>{now_bkk_str}</code>\n"
+        f"• <b>Notified At</b>: <code>{now_bkk_str}</code>"
+        f"{ret_text}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -1415,13 +1384,14 @@ def main():
     print(f"4. Options Series   : {len(opt_series):>5} rows")
     print(f"5. BOT THOR Rates   : {len(thor_rates):>5} rows (trade_date: {thor_rates[0]['trade_date'] if thor_rates else 'N/A'})")
     print(f"Total Execution Time: {time.time() - start_time:.2f} seconds.")
-    # 6. Automated FIFO Intraday Retention & Storage Guard
+    # 6. Automated Tiered Intraday Retention & Storage Guard
+    retention_stats = None
     if turso_url and turso_token:
         pipeline_url = normalize_turso_url(turso_url)
-        run_fifo_retention_guard(pipeline_url=pipeline_url, auth_token=turso_token)
+        retention_stats = run_tiered_retention_guard(pipeline_url=pipeline_url, auth_token=turso_token)
     else:
         db_file = args.local_db or "eod_tfex.db"
-        run_fifo_retention_guard(db_file=db_file)
+        retention_stats = run_tiered_retention_guard(db_file=db_file)
 
     # 7. Automated Telegram EOD Completion Alert
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1435,7 +1405,8 @@ def main():
                 pipeline_url=pipeline_url,
                 auth_token=turso_token,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count
+                scrape_failed_count=scrape_failed_count,
+                retention_stats=retention_stats
             )
         else:
             db_file = args.local_db or "eod_tfex.db"
@@ -1444,7 +1415,8 @@ def main():
                 chat_id=chat_id,
                 db_file=db_file,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count
+                scrape_failed_count=scrape_failed_count,
+                retention_stats=retention_stats
             )
     else:
         print("[TELEGRAM] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. Skipping alert.")
