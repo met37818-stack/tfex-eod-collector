@@ -267,7 +267,7 @@ def select_dynamic_thor_rate(
         if rate is not None and rate > 0:
             return rate, label
 
-    return 0.015, "DEFAULT"
+    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
 
 
 def compute_greeks_records_for_date(
@@ -317,15 +317,13 @@ def compute_greeks_records_for_date(
         # Dynamic contract-specific THOR rate
         if isinstance(thor_rate, dict):
             contract_thor, _ = select_dynamic_thor_rate(thor_rate, dte)
-        elif isinstance(thor_rate, (int, float)):
+        elif isinstance(thor_rate, (int, float)) and thor_rate > 0:
             contract_thor = float(thor_rate)
         else:
-            contract_thor = 0.015
+            raise ValueError(f"Invalid THOR rate provided: {thor_rate}")
 
-        # Option pricing reference: settlement_price preferred, close fallback
+        # Option pricing reference: settlement_price ONLY (Strict Fail-Loud / No Close fallback)
         opt_price = opt.get("settlement_price")
-        if opt_price is None or opt_price <= 0:
-            opt_price = opt.get("close")
 
         iv = None
         if opt_price and opt_price > 0:
@@ -471,7 +469,7 @@ def run_eod_greeks_pipeline(
         # 2. Query Data for this date
         options_rows = []
         futures_dict = {}
-        thor_dict = {"overnight": 0.02, "1m": None, "3m": None, "6m": None}
+        thor_dict = {"overnight": None, "1m": None, "3m": None, "6m": None}
 
         if is_turso:
             sql_opt = "SELECT symbol, series, option_type, strike, settlement_price, close, oi FROM eod_options_series WHERE trade_date = ?;"
@@ -545,6 +543,9 @@ def run_eod_greeks_pipeline(
                 thor_dict["3m"] = float(tr_row[2]) if len(tr_row) > 2 and tr_row[2] is not None else None
                 thor_dict["6m"] = float(tr_row[3]) if len(tr_row) > 3 and tr_row[3] is not None else None
             conn.close()
+
+        if not any(v is not None and v > 0 for v in thor_dict.values()):
+            raise ValueError(f"No valid THOR rate found in eod_thor_rates for {t_date}")
 
         if not options_rows:
             print(f"[GREEKS] No options rows found for {t_date}.")

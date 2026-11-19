@@ -448,15 +448,18 @@ def fetch_options_series(session: requests.Session, active_series: list[str]) ->
             return []
 
     print(f"[Section 4] Fetching historical trading for {len(symbols)} options with 8 workers...")
+    scrape_failed_count = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_sym = {executor.submit(fetch_single_option, sym): sym for sym in symbols}
         for future in as_completed(future_to_sym):
             recs = future.result()
             if recs:
                 results.extend(recs)
+            else:
+                scrape_failed_count += 1
 
-    print(f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts.")
-    return results
+    print(f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts (Failed: {scrape_failed_count}).")
+    return results, scrape_failed_count
 
 def fetch_thor_rates() -> list[dict]:
     """
@@ -1063,7 +1066,8 @@ def send_eod_telegram_alert(
     pipeline_url: str = None,
     auth_token: str = None,
     db_file: str = None,
-    force_notify: bool = False
+    force_notify: bool = False,
+    scrape_failed_count: int = 0
 ) -> bool:
     """
     Sends EOD data collection summary alert to Telegram on Mon-Fri morning (05:30 - 07:30 ICT).
@@ -1234,13 +1238,14 @@ def send_eod_telegram_alert(
     thor_6m_text = f"<code>{thor_6m:.5f}%</code>" if thor_6m is not None else "N/A"
     thor_disp_date = thor_date or latest_date
 
+    opt_fail_text = f" ⚠️ <i>(ดึงไม่สำเร็จ {scrape_failed_count} สัญญา)</i>" if scrape_failed_count > 0 else ""
     message = (
         f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ <b>EOD Data สำหรับวันเทรด {latest_date} ถูกดึงลง Turso เรียบร้อยแล้ว</b>\n\n"
         f"<b>📦 รายการข้อมูลที่จัดเก็บ ({latest_date}):</b>\n"
         f"• <b>Futures Series</b>: <code>{fut_cnt}</code> สัญญา (Active Series)\n"
-        f"• <b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P)\n"
+        f"• <b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P){opt_fail_text}\n"
         f"• <b>Investor Types</b>: <code>{inv_cnt}</code> กลุ่ม (Futures, Calls, Puts)\n"
         f"• <b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า\n\n"
         f"<b>📈 ดอกเบี้ยอ้างอิง BOT THOR ({thor_disp_date}):</b>\n"
@@ -1364,7 +1369,7 @@ def main():
     inv_types = fetch_investor_types(tfex_session)
     mkt_stats = fetch_market_stats(tfex_session)
     fut_series = fetch_futures_series(tfex_session, active_series)
-    opt_series = fetch_options_series(tfex_session, active_series)
+    opt_series, scrape_failed_count = fetch_options_series(tfex_session, active_series)
     thor_rates = fetch_thor_rates()
 
     elapsed_collect = time.time() - start_time
@@ -1429,7 +1434,8 @@ def main():
                 chat_id=chat_id,
                 pipeline_url=pipeline_url,
                 auth_token=turso_token,
-                force_notify=args.notify
+                force_notify=args.notify,
+                scrape_failed_count=scrape_failed_count
             )
         else:
             db_file = args.local_db or "eod_tfex.db"
@@ -1437,7 +1443,8 @@ def main():
                 bot_token=bot_token,
                 chat_id=chat_id,
                 db_file=db_file,
-                force_notify=args.notify
+                force_notify=args.notify,
+                scrape_failed_count=scrape_failed_count
             )
     else:
         print("[TELEGRAM] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. Skipping alert.")
