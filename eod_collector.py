@@ -16,6 +16,7 @@ import os
 import sys
 import re
 import json
+import math
 import time
 import argparse
 import datetime
@@ -712,7 +713,11 @@ DDL_STATEMENTS = [
 ]
 
 def to_turso_arg(val) -> dict:
-    """Format Python values into libSQL / Turso typed arguments."""
+    """Format Python values into libSQL / Turso typed arguments.
+
+    NaN/Inf are mapped to NULL: they are not valid JSON, so serialising one
+    would make the whole pipeline request fail.
+    """
     if val is None:
         return {"type": "null"}
     elif isinstance(val, bool):
@@ -720,6 +725,8 @@ def to_turso_arg(val) -> dict:
     elif isinstance(val, int):
         return {"type": "integer", "value": str(val)}
     elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return {"type": "null"}
         return {"type": "float", "value": val}
     else:
         return {"type": "text", "value": str(val)}
@@ -784,13 +791,13 @@ def execute_sqlite_local(db_path: str, statements: list[dict]):
     """Execute statements against local SQLite database (for testing and fallback)."""
     print(f"[Local SQLite] Executing {len(statements)} statements on {db_path}...")
     conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    for stmt in statements:
-        sql = stmt["sql"].strip()
-        args = stmt.get("args", [])
-        cursor.execute(sql, args)
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        for stmt in statements:
+            cursor.execute(stmt["sql"].strip(), stmt.get("args", []))
+        conn.commit()
+    finally:
+        conn.close()
     print(f"[Local SQLite] Successfully committed {len(statements)} statements to {db_path}.")
 
 def build_upsert_statements(

@@ -341,6 +341,18 @@ class TestTelegramTokenHygiene(unittest.TestCase):
                 os.unlink(tmp.name)
 
 
+class TestTursoArgEncoding(unittest.TestCase):
+    """NaN/Inf are not valid JSON; they must degrade to NULL, not break a batch."""
+
+    def test_nan_and_inf_become_null(self):
+        import eod_collector as ec
+
+        self.assertEqual(ec.to_turso_arg(float("nan")), {"type": "null"})
+        self.assertEqual(ec.to_turso_arg(float("inf")), {"type": "null"})
+        self.assertEqual(ec.to_turso_arg(1.5), {"type": "float", "value": 1.5})
+        self.assertEqual(ec.to_turso_arg(True), {"type": "integer", "value": "1"})
+
+
 class TestRetentionReporting(unittest.TestCase):
     """A DELETE whose row count cannot be confirmed must not be reported as 0."""
 

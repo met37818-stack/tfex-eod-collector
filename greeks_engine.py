@@ -145,7 +145,9 @@ def calculate_black76_full_greeks(
         charm_raw = -r * disc * norm_cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))
         charm_1d = charm_raw / 365.0
 
-    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry 1/T asymptotic explosion
+    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry 1/T asymptotic
+    # explosion. The clamp is deliberate: rows with dte<=2 carry charm clipped to
+    # +/-5 rather than the unbounded analytic value.
     if T <= (2.0 / 365.0) or math.isnan(charm_1d) or math.isinf(charm_1d):
         charm_1d = max(-5.0, min(5.0, charm_1d)) if not (math.isnan(charm_1d) or math.isinf(charm_1d)) else 0.0
 
@@ -299,6 +301,9 @@ def compute_greeks_records_for_date(
         # Expiry & DTE
         expiry_date = get_series_expiry_date(series)
         dte = max(0, (expiry_date - trade_date_obj).days)
+        # Floor T at half a day so an expiry-day row (dte=0) does not divide by
+        # zero. Consequence: greeks for dte=0 describe a 12-hour option, not an
+        # expiring one — treat those rows as indicative only.
         T_years = max(dte, 0.5) / 365.0
 
         # Dynamic contract-specific THOR rate
@@ -339,7 +344,8 @@ def compute_greeks_records_for_date(
                     "updated_at_bkk": now_bkk_str
                 })
                 valid_count += 1
-            except Exception:
+            except Exception as exc:
+                print(f"[GREEKS] {symbol}: greeks calculation failed ({type(exc).__name__}: {exc})")
                 greeks_records.append({
                     "trade_date": trade_date, "symbol": symbol, "series": series,
                     "option_type": opt_type, "strike": strike, "underlying_futures": underlying,
