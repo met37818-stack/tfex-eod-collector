@@ -17,6 +17,10 @@ from pathlib import Path
 import requests
 import openpyxl
 
+from tfex_common.turso import execute_pipeline
+from tfex_common.turso import normalize_url as normalize_turso_url
+from tfex_common.turso import to_arg as to_turso_arg
+
 # ==============================================================================
 # ENVIRONMENT & HELPER FUNCTIONS
 # ==============================================================================
@@ -42,30 +46,7 @@ def load_dotenv(path: str = ".env"):
             except Exception as e:
                 print(f"[WARN] Could not parse .env at {p}: {e}")
 
-def normalize_turso_url(raw_url: str) -> str:
-    """Normalize Turso URL to HTTP Pipeline endpoint (/v2/pipeline)."""
-    url = raw_url.strip()
-    if url.startswith("libsql://"):
-        url = "https://" + url[len("libsql://"):]
-    elif not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-    url = url.rstrip("/")
-    if not url.endswith("/v2/pipeline"):
-        url = url + "/v2/pipeline"
-    return url
 
-def to_turso_arg(val) -> dict:
-    """Format Python values into libSQL / Turso typed arguments."""
-    if val is None:
-        return {"type": "null"}
-    elif isinstance(val, bool):
-        return {"type": "integer", "value": "1" if val else "0"}
-    elif isinstance(val, int):
-        return {"type": "integer", "value": str(val)}
-    elif isinstance(val, float):
-        return {"type": "float", "value": val}
-    else:
-        return {"type": "text", "value": str(val)}
 
 def parse_date(val) -> str | None:
     """Safely parse various Excel date formats into YYYY-MM-DD."""
@@ -158,49 +139,29 @@ def get_turso_table_counts(pipeline_url: str, auth_token: str) -> dict[str, int]
 
 def execute_turso_pipeline(pipeline_url: str, auth_token: str, statements: list[dict], batch_size: int = 150):
     """
-    Execute batch statements against Turso Cloud SQLite via HTTP Pipeline API.
+    Batch writer for the Excel backfill: same chunking/progress output as before,
+    transport from tfex_common.turso.execute_pipeline().
     """
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
-
     total = len(statements)
     print(f"[Turso Pipeline] Sending {total} statements in batches of {batch_size}...")
 
     start_t = time.time()
+    total_batches = (total + batch_size - 1) // batch_size
     for i in range(0, total, batch_size):
         chunk = statements[i:i + batch_size]
-        requests_payload = []
-        for stmt in chunk:
-            sql = stmt["sql"].strip()
-            args = stmt.get("args", [])
-            turso_args = [to_turso_arg(a) for a in args]
-            requests_payload.append({
+        requests_payload = [
+            {
                 "type": "execute",
                 "stmt": {
-                    "sql": sql,
-                    "args": turso_args
-                }
-            })
+                    "sql": stmt["sql"].strip(),
+                    "args": [to_turso_arg(a) for a in stmt.get("args", [])],
+                },
+            }
+            for stmt in chunk
+        ]
         requests_payload.append({"type": "close"})
-
-        resp = requests.post(
-            pipeline_url,
-            headers=headers,
-            json={"requests": requests_payload},
-            timeout=40
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Turso Pipeline failed ({resp.status_code}): {resp.text}")
-
-        res_json = resp.json()
-        for idx, result in enumerate(res_json.get("results", [])):
-            if result.get("type") == "error":
-                raise RuntimeError(f"Turso statement execution error at index {idx}: {result.get('error')}")
-
+        execute_pipeline(pipeline_url, auth_token, payload={"requests": requests_payload}, timeout=40)
         batch_idx = (i // batch_size) + 1
-        total_batches = (total + batch_size - 1) // batch_size
         print(f"  -> Batch {batch_idx}/{total_batches} ({len(chunk)} stmts) completed.")
 
     elapsed = time.time() - start_t

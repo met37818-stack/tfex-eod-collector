@@ -44,6 +44,9 @@ from tfex_common.calendar import (  # noqa: E402
     get_penultimate_business_day,
     is_trading_day,
 )
+from tfex_common.turso import execute_pipeline  # noqa: E402
+from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
+from tfex_common.turso import to_arg as to_turso_arg  # noqa: E402
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -750,78 +753,34 @@ DDL_STATEMENTS = [
     """
 ]
 
-def to_turso_arg(val) -> dict:
-    """Format Python values into libSQL / Turso typed arguments.
 
-    NaN/Inf are mapped to NULL: they are not valid JSON, so serialising one
-    would make the whole pipeline request fail.
-    """
-    if val is None:
-        return {"type": "null"}
-    elif isinstance(val, bool):
-        return {"type": "integer", "value": "1" if val else "0"}
-    elif isinstance(val, int):
-        return {"type": "integer", "value": str(val)}
-    elif isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
-            return {"type": "null"}
-        return {"type": "float", "value": val}
-    else:
-        return {"type": "text", "value": str(val)}
-
-def normalize_turso_url(raw_url: str) -> str:
-    """Normalize Turso URL to HTTP Pipeline endpoint (/v2/pipeline)."""
-    url = raw_url.strip()
-    if url.startswith("libsql://"):
-        url = "https://" + url[len("libsql://"):]
-    elif not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-    url = url.rstrip("/")
-    if not url.endswith("/v2/pipeline"):
-        url = url + "/v2/pipeline"
-    return url
 
 def execute_turso_pipeline(pipeline_url: str, auth_token: str, statements: list[dict], batch_size: int = 100):
     """
-    Execute batch statements against Turso Cloud SQLite via HTTP Pipeline API.
-    """
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
+    Batch writer: splits statements into chunks and sends each through
+    tfex_common.turso.execute_pipeline().
 
+    The chunking and the operator-facing progress output stay here; the transport
+    (retry on network/429/5xx, statement-error detection, token redaction) comes
+    from the shared package.
+    """
     total = len(statements)
     print(f"[Turso Pipeline] Sending {total} statements to {pipeline_url} in batches of {batch_size}...")
 
     for i in range(0, total, batch_size):
         chunk = statements[i:i + batch_size]
-        requests_payload = []
-        for stmt in chunk:
-            sql = stmt["sql"].strip()
-            args = stmt.get("args", [])
-            turso_args = [to_turso_arg(a) for a in args]
-            requests_payload.append({
+        requests_payload = [
+            {
                 "type": "execute",
                 "stmt": {
-                    "sql": sql,
-                    "args": turso_args
-                }
-            })
+                    "sql": stmt["sql"].strip(),
+                    "args": [to_turso_arg(a) for a in stmt.get("args", [])],
+                },
+            }
+            for stmt in chunk
+        ]
         requests_payload.append({"type": "close"})
-
-        resp = requests.post(
-            pipeline_url,
-            headers=headers,
-            json={"requests": requests_payload},
-            timeout=30
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Turso Pipeline failed ({resp.status_code}): {resp.text}")
-
-        res_json = resp.json()
-        for idx, result in enumerate(res_json.get("results", [])):
-            if result.get("type") == "error":
-                raise RuntimeError(f"Turso statement execution error at index {idx}: {result.get('error')}")
+        execute_pipeline(pipeline_url, auth_token, payload={"requests": requests_payload}, timeout=30)
 
     print(f"[Turso Pipeline] Successfully executed all {total} statements.")
 
