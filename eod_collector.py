@@ -21,6 +21,7 @@ import argparse
 import datetime
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import sqlite3
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -176,6 +177,26 @@ def init_tfex_session() -> requests.Session:
     except Exception as e:
         print(f"[TFEX Session] Warning: Failed to pre-fetch cookies: {e}")
     return session
+
+
+_thread_local = threading.local()
+
+
+def _worker_session() -> requests.Session:
+    """One requests.Session per worker thread.
+
+    requests.Session is not thread-safe (shared connection pool and cookie jar)
+    and fetch_options_series fans out over ThreadPoolExecutor(max_workers=8).
+    Sharing the main-thread session across those workers produced intermittent
+    timeouts and interleaved connection state.
+    """
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(BASE_HEADERS)
+        _thread_local.session = session
+    return session
+
 
 def fetch_investor_types(session: requests.Session) -> list[dict]:
     """
@@ -372,7 +393,7 @@ def fetch_options_series(session: requests.Session, active_series: list[str]) ->
 
         opt_url = f"https://www.tfex.co.th/api/set/tfex/series/{sym}/historical-trading?website=tfex&lang=en"
         try:
-            r = session.get(opt_url, headers=headers, timeout=12)
+            r = _worker_session().get(opt_url, headers=headers, timeout=12)
             if r.status_code != 200:
                 return []
             data = r.json().get("data", [])

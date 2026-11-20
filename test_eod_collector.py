@@ -5,6 +5,7 @@ import datetime
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 
 from greeks_engine import (
@@ -143,6 +144,27 @@ class TestEODGreeksEngine(unittest.TestCase):
         # Official weekday closures: 19 in 2026, 18 in 2027 (set.or.th calendar).
         self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2026-")]), 19)
         self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2027-")]), 18)
+
+
+class TestWorkerSessions(unittest.TestCase):
+    """requests.Session must not be shared across the 8 scrape worker threads."""
+
+    def test_worker_session_is_per_thread(self):
+        from eod_collector import _worker_session
+
+        main_session = _worker_session()
+        self.assertIs(main_session, _worker_session(), "same thread must reuse its session")
+
+        seen = {}
+
+        def grab():
+            seen["worker"] = _worker_session()
+
+        thread = threading.Thread(target=grab)
+        thread.start()
+        thread.join()
+
+        self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):
