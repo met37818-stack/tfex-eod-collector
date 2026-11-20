@@ -1,7 +1,9 @@
 """
 Unit tests for strict fail-loud data honesty and tiered retention in tfex-eod-collector
 """
+import contextlib
 import datetime
+import io
 import os
 import sqlite3
 import tempfile
@@ -293,6 +295,50 @@ class TestOptionScrapeAccounting(unittest.TestCase):
         self.assertEqual(no_data, 1, "HTTP 200 with no rows must be counted as no-data")
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["symbol"], "S50Z26C940")
+
+
+class TestTelegramTokenHygiene(unittest.TestCase):
+    """The bot token is embedded in the request URL; it must never reach a log."""
+
+    def test_token_never_reaches_stdout_on_transport_error(self):
+        import eod_collector as ec
+
+        token = "123456789:AAFakeTestTokenValueMustNotLeak"
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE eod_futures_series (trade_date TEXT, series TEXT)")
+            cur.execute("CREATE TABLE eod_options_series (trade_date TEXT, symbol TEXT)")
+            cur.execute("CREATE TABLE eod_investor_types (trade_date TEXT, category TEXT)")
+            cur.execute("CREATE TABLE eod_market_stats (trade_date TEXT, market_id TEXT)")
+            cur.execute("CREATE TABLE eod_thor_rates (trade_date TEXT, thor_rate REAL, thor_1m_avg REAL, thor_3m_avg REAL, thor_6m_avg REAL)")
+            cur.execute("CREATE TABLE eod_telegram_log (trade_date TEXT PRIMARY KEY, notified_at_bkk TEXT, message_snippet TEXT)")
+            cur.execute("INSERT INTO eod_futures_series VALUES ('2026-11-20', 'S50Z26')")
+            cur.execute("INSERT INTO eod_thor_rates VALUES ('2026-11-20', 1.25, 1.20, 1.30, 1.40)")
+            conn.commit()
+            conn.close()
+
+            transport_error = requests.ConnectionError(
+                f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded with url: /bot{token}/sendMessage"
+            )
+            buffer = io.StringIO()
+            with mock.patch.object(ec.requests, "post", side_effect=transport_error),                     contextlib.redirect_stdout(buffer):
+                sent = ec.send_eod_telegram_alert(
+                    bot_token=token,
+                    chat_id="1",
+                    db_file=tmp.name,
+                    force_notify=True,
+                )
+
+            output = buffer.getvalue()
+            self.assertFalse(sent)
+            self.assertNotIn(token, output, "bot token leaked into stdout")
+            self.assertIn("ConnectionError", output)
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):

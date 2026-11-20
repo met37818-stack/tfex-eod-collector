@@ -1291,11 +1291,16 @@ def send_eod_telegram_alert(
     try:
         resp = requests.post(tg_url, json=payload, timeout=15)
         if resp.status_code != 200:
-            print(f"[TELEGRAM] Warning: Telegram API failed ({resp.status_code}): {resp.text}")
+            # The response body is a Telegram error envelope (no token); the URL
+            # is never logged because it embeds the bot token.
+            body = (resp.text or "")[:200]
+            print(f"[TELEGRAM] Warning: Telegram API rejected the message ({resp.status_code}): {body}")
             return False
         print(f"[TELEGRAM] Notification dispatched successfully to chat_id {chat_id} for trade date {latest_date}.")
-    except Exception as e:
-        print(f"[TELEGRAM] Error sending Telegram message: {e}")
+    except requests.RequestException as exc:
+        # requests puts the full URL — including /bot<token>/ — into its exception
+        # messages, so only the exception type is logged.
+        print(f"[TELEGRAM] Error sending message: {type(exc).__name__}")
         return False
 
     # 6. Record Notification in eod_telegram_log
