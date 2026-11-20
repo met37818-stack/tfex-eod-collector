@@ -7,6 +7,9 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
+
+import requests
 
 from greeks_engine import (
     select_dynamic_thor_rate,
@@ -165,6 +168,98 @@ class TestWorkerSessions(unittest.TestCase):
         thread.join()
 
         self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
+
+
+class TestRetryHelper(unittest.TestCase):
+    class _FakeResp:
+        def __init__(self, status_code, headers=None, payload=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.text = ""
+            self._payload = payload if payload is not None else {}
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    def test_retries_429_then_succeeds(self):
+        import eod_collector as ec
+
+        responses = [self._FakeResp(429, {"Retry-After": "0"}), self._FakeResp(200, payload={"ok": True})]
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                return responses.pop(0)
+
+        with mock.patch.object(ec.time, "sleep", lambda *_: None):
+            resp = ec.get_with_retry(FakeSession(), "https://example.invalid/x", attempts=3)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_raises_after_attempts_exhausted(self):
+        import eod_collector as ec
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                raise requests.RequestException("boom")
+
+        with mock.patch.object(ec.time, "sleep", lambda *_: None):
+            with self.assertRaises(RuntimeError):
+                ec.get_with_retry(FakeSession(), "https://example.invalid/x", attempts=2)
+
+
+class TestOptionScrapeAccounting(unittest.TestCase):
+    """A throttled fetch and a contract with no rows are different failures."""
+
+    def test_errors_and_empty_contracts_are_counted_separately(self):
+        import eod_collector as ec
+
+        def payload_resp(payload):
+            class R:
+                status_code = 200
+                headers = {}
+                text = ""
+
+                def json(self_inner):
+                    return payload
+
+            return R()
+
+        class Worker:
+            def get(self, url, **kwargs):
+                if "S50Z26C900" in url:
+                    raise requests.RequestException("throttled")
+                if "S50Z26C920" in url:
+                    return payload_resp({"data": []})
+                return payload_resp({"data": [{
+                    "date": "2026-11-20T00:00:00",
+                    "settlementPrice": 12.5,
+                    "totalVolume": 3,
+                    "oi": 4,
+                }]})
+
+        class MainSession:
+            def get(self, url, **kwargs):
+                class R:
+                    status_code = 200
+                    headers = {}
+                    text = "<div>S50Z26C900 S50Z26C920 S50Z26C940</div>"
+
+                    def raise_for_status(self_inner):
+                        return None
+
+                return R()
+
+        with mock.patch.object(ec, "_worker_session", return_value=Worker()), \
+                mock.patch.object(ec, "get_with_retry", side_effect=lambda s, u, **k: s.get(u, **k)):
+            records, errors, no_data = ec.fetch_options_series(MainSession(), ["S50Z26"])
+
+        self.assertEqual(errors, 1, "network error must be counted as a fetch error")
+        self.assertEqual(no_data, 1, "HTTP 200 with no rows must be counted as no-data")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["symbol"], "S50Z26C940")
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):

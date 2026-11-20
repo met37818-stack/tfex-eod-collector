@@ -198,6 +198,53 @@ def _worker_session() -> requests.Session:
     return session
 
 
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _retry_delay(resp: requests.Response, base_delay: float, attempt: int) -> float:
+    header = resp.headers.get("Retry-After") if resp is not None else None
+    if header:
+        try:
+            return min(float(header), 30.0)
+        except (TypeError, ValueError):
+            pass
+    return min(base_delay * (2 ** attempt), 30.0)
+
+
+def get_with_retry(
+    session: requests.Session,
+    url: str,
+    *,
+    headers: Optional[dict] = None,
+    attempts: int = 3,
+    base_delay: float = 1.5,
+    timeout: int = 15,
+) -> requests.Response:
+    """GET with bounded exponential backoff.
+
+    TFEX throttles bursts (Section 4 runs 8 workers) and intermittently answers
+    5xx. Without retries a throttled request just produced silently-missing
+    contracts, indistinguishable from a strike that never traded.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout)
+            if resp.status_code in RETRY_STATUS or resp.status_code >= 500:
+                delay = _retry_delay(resp, base_delay, attempt)
+                print(f"[retry] {attempt + 1}/{attempts} HTTP {resp.status_code} -> sleep {delay:.1f}s")
+                time.sleep(delay)
+                last_error = RuntimeError(f"HTTP {resp.status_code}")
+                continue
+            return resp
+        except requests.RequestException as exc:
+            delay = min(base_delay * (2 ** attempt), 30)
+            print(f"[retry] {attempt + 1}/{attempts} {type(exc).__name__} -> sleep {delay:.1f}s")
+            time.sleep(delay)
+            last_error = exc
+    raise RuntimeError(f"GET failed after {attempts} attempts: {url}") from last_error
+
+
 def fetch_investor_types(session: requests.Session) -> list[dict]:
     """
     Section 1: Investor Types (eod_investor_types).
@@ -205,7 +252,7 @@ def fetch_investor_types(session: requests.Session) -> list[dict]:
     """
     url = "https://www.tfex.co.th/en/market-data/historical-data/trading-by-investor-types"
     print(f"[Section 1] Fetching Investor Types from {url}...")
-    resp = session.get(url, timeout=15)
+    resp = get_with_retry(session, url, timeout=15)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -286,7 +333,7 @@ def fetch_market_stats(session: requests.Session) -> list[dict]:
             f"&marketListId={market_id}&instrumentId={inst_id}&trade=all"
         )
         print(f"[Section 2] Fetching Market Stats for {market_id}/{inst_id}...")
-        resp = session.get(api_url, headers=headers, timeout=15)
+        resp = get_with_retry(session, api_url, headers=headers, timeout=15)
         if resp.status_code != 200:
             print(f"[Section 2] Warning: Failed to fetch {market_id}/{inst_id} ({resp.status_code})")
             continue
@@ -329,7 +376,7 @@ def fetch_futures_series(session: requests.Session, active_series: list[str]) ->
     for series in active_series:
         api_url = f"https://www.tfex.co.th/api/set/tfex/series/{series}/historical-trading?website=tfex&lang=en"
         print(f"[Section 3] Fetching Futures Series {series}...")
-        resp = session.get(api_url, headers=headers, timeout=15)
+        resp = get_with_retry(session, api_url, headers=headers, timeout=15)
         if resp.status_code != 200:
             print(f"[Section 3] Warning: Failed to fetch series {series} ({resp.status_code})")
             continue
@@ -358,15 +405,23 @@ def fetch_futures_series(session: requests.Session, active_series: list[str]) ->
     print(f"[Section 3] Extracted {len(results)} futures series records for {active_series}.")
     return results
 
-def fetch_options_series(session: requests.Session, active_series: list[str]) -> list[dict]:
+def fetch_options_series(
+    session: requests.Session,
+    active_series: list[str],
+) -> tuple[list[dict], int, int]:
     """
     Section 4: Active Options Series (eod_options_series).
     Scrapes contract symbols for active series, then concurrently fetches 5 days history
     with ThreadPoolExecutor(8 workers).
+
+    Returns (records, fetch_error_count, no_data_count). An HTTP/network failure
+    and a contract that genuinely has no rows are different problems and are
+    counted separately: the old code collapsed both into one "failed" number and
+    logged neither.
     """
     market_page_url = "https://www.tfex.co.th/en/products/equity/set50-index-options/market-data"
     print(f"[Section 4] Discovering option symbols from {market_page_url}...")
-    resp = session.get(market_page_url, timeout=15)
+    resp = get_with_retry(session, market_page_url, timeout=15)
     resp.raise_for_status()
 
     # Regex pattern matching active series options, e.g. (?:S50Z26|S50H27)[CP]\d+
@@ -392,49 +447,56 @@ def fetch_options_series(session: requests.Session, active_series: list[str]) ->
         strike_val = float(strike_str)
 
         opt_url = f"https://www.tfex.co.th/api/set/tfex/series/{sym}/historical-trading?website=tfex&lang=en"
-        try:
-            r = _worker_session().get(opt_url, headers=headers, timeout=12)
-            if r.status_code != 200:
-                return []
-            data = r.json().get("data", [])
-            opt_records = []
-            for item in data[:5]:
-                raw_date = item.get("date")
-                if not raw_date:
-                    continue
-                opt_records.append({
-                    "trade_date": raw_date[:10],
-                    "symbol": sym,
-                    "series": ser,
-                    "option_type": opt_type,
-                    "strike": strike_val,
-                    "open": clean_float(item.get("open")),
-                    "high": clean_float(item.get("high")),
-                    "low": clean_float(item.get("low")),
-                    "close": clean_float(item.get("close")),
-                    "settlement_price": clean_float(item.get("settlementPrice")),
-                    "chg": clean_float(item.get("change")),
-                    "pct_chg": clean_float(item.get("percentChange")),
-                    "volume": clean_int(item.get("totalVolume")),
-                    "oi": clean_int(item.get("oi")),
-                })
-            return opt_records
-        except Exception as e:
-            return []
+        r = get_with_retry(_worker_session(), opt_url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json().get("data", [])
+        opt_records = []
+        for item in data[:5]:
+            raw_date = item.get("date")
+            if not raw_date:
+                continue
+            opt_records.append({
+                "trade_date": raw_date[:10],
+                "symbol": sym,
+                "series": ser,
+                "option_type": opt_type,
+                "strike": strike_val,
+                "open": clean_float(item.get("open")),
+                "high": clean_float(item.get("high")),
+                "low": clean_float(item.get("low")),
+                "close": clean_float(item.get("close")),
+                "settlement_price": clean_float(item.get("settlementPrice")),
+                "chg": clean_float(item.get("change")),
+                "pct_chg": clean_float(item.get("percentChange")),
+                "volume": clean_int(item.get("totalVolume")),
+                "oi": clean_int(item.get("oi")),
+            })
+        return opt_records
 
     print(f"[Section 4] Fetching historical trading for {len(symbols)} options with 8 workers...")
-    scrape_failed_count = 0
+    fetch_error_count = 0
+    no_data_count = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_sym = {executor.submit(fetch_single_option, sym): sym for sym in symbols}
         for future in as_completed(future_to_sym):
-            recs = future.result()
+            sym = future_to_sym[future]
+            try:
+                recs = future.result()
+            except Exception as exc:
+                fetch_error_count += 1
+                print(f"[Section 4] FAILED {sym}: {type(exc).__name__}: {exc}")
+                continue
             if recs:
                 results.extend(recs)
             else:
-                scrape_failed_count += 1
+                no_data_count += 1
 
-    print(f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts (Failed: {scrape_failed_count}).")
-    return results, scrape_failed_count
+    print(
+        f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts "
+        f"(fetch errors: {fetch_error_count}, no data: {no_data_count})."
+    )
+    return results, fetch_error_count, no_data_count
 
 def fetch_thor_rates() -> list[dict]:
     """
@@ -446,7 +508,7 @@ def fetch_thor_rates() -> list[dict]:
     print(f"[Section 5] Fetching THOR rates from {url}...")
     headers = {"User-Agent": BASE_HEADERS["User-Agent"]}
     session = requests.Session()
-    r = session.get(url, headers=headers, timeout=15)
+    r = get_with_retry(session, url, headers=headers, timeout=15)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -995,7 +1057,8 @@ def send_eod_telegram_alert(
     auth_token: str = None,
     db_file: str = None,
     force_notify: bool = False,
-    scrape_failed_count: int = 0,
+    fetch_error_count: int = 0,
+    no_data_count: int = 0,
     retention_stats: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
@@ -1180,7 +1243,12 @@ def send_eod_telegram_alert(
             f"• <b>eod_* & daily_realized_vol</b>: <code>ถาวร (ห้ามลบ)</code>"
         )
 
-    opt_fail_text = f" ⚠️ <i>(ดึงไม่สำเร็จ {scrape_failed_count} สัญญา)</i>" if scrape_failed_count > 0 else ""
+    fail_bits = []
+    if fetch_error_count > 0:
+        fail_bits.append(f"error {fetch_error_count}")
+    if no_data_count > 0:
+        fail_bits.append(f"ไม่มีข้อมูล {no_data_count}")
+    opt_fail_text = f" ⚠️ <i>({' / '.join(fail_bits)} สัญญา)</i>" if fail_bits else ""
     message = (
         f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1312,7 +1380,7 @@ def main():
     inv_types = fetch_investor_types(tfex_session)
     mkt_stats = fetch_market_stats(tfex_session)
     fut_series = fetch_futures_series(tfex_session, active_series)
-    opt_series, scrape_failed_count = fetch_options_series(tfex_session, active_series)
+    opt_series, fetch_error_count, no_data_count = fetch_options_series(tfex_session, active_series)
     thor_rates = fetch_thor_rates()
 
     elapsed_collect = time.time() - start_time
@@ -1379,7 +1447,8 @@ def main():
                 pipeline_url=pipeline_url,
                 auth_token=turso_token,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count,
+                fetch_error_count=fetch_error_count,
+                no_data_count=no_data_count,
                 retention_stats=retention_stats
             )
         else:
@@ -1389,7 +1458,8 @@ def main():
                 chat_id=chat_id,
                 db_file=db_file,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count,
+                fetch_error_count=fetch_error_count,
+                no_data_count=no_data_count,
                 retention_stats=retention_stats
             )
     else:
