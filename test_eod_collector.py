@@ -20,7 +20,12 @@ from greeks_engine import (
     calculate_black76_full_greeks,
     black76_price,
 )
-from calendar_utils import SET_HOLIDAYS, get_penultimate_business_day, get_series_expiry_date
+from calendar_utils import (
+    SET_HOLIDAYS,
+    get_penultimate_business_day,
+    get_series_expiry_date,
+    is_trading_day,
+)
 from eod_collector import (
     get_active_quarterly_series,
     resolve_target_trade_date,
@@ -150,9 +155,18 @@ class TestEODGreeksEngine(unittest.TestCase):
         self.assertEqual(get_series_expiry_date("H27"), datetime.date(2027, 3, 30))
 
     def test_holiday_list_is_complete(self):
-        # Official weekday closures: 19 in 2026, 18 in 2027 (set.or.th calendar).
-        self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2026-")]), 19)
+        # Official weekday closures: 20 in 2026, 18 in 2027 (set.or.th calendar).
+        self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2026-")]), 20)
         self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2027-")]), 18)
+
+    def test_imf_wbg_closure_is_not_a_trading_day(self):
+        # 2026-10-16 was a full closure: TFEX published no daily statistics that
+        # day while 10-14/15/19/20 were normal sessions. It was missing from this
+        # calendar, so the collector treated a closed day as a session.
+        self.assertIn("2026-10-16", SET_HOLIDAYS)
+        self.assertFalse(is_trading_day(datetime.date(2026, 10, 16)))
+        self.assertTrue(is_trading_day(datetime.date(2026, 10, 15)))
+        self.assertTrue(is_trading_day(datetime.date(2026, 10, 19)))
 
 
 class TestWorkerSessions(unittest.TestCase):

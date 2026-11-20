@@ -13,14 +13,16 @@ Contracts expire on the penultimate business day of the contract month
 Holiday sources (update once per year, when SET publishes the next calendar):
 - 2026: BOT notification "Financial institutions' holidays and additional
   special holiday for B.E. 2569 (2026)" dated 5 Aug 2025, plus the SET
-  calendar amendments dated 16 Jun 2026 and 19 Nov 2026 — 19 weekday closures.
+  calendar amendments dated 16 Jun 2026 and 19 Nov 2026 — 20 weekday closures.
   https://www.set.or.th/en/about/event-calendar/holiday?year=2026
 - 2027: https://www.set.or.th/en/about/event-calendar/holiday?year=2027
   — 18 weekday closures.
 
-2026-10-16 (the IMF/WBG annual-meeting closure some brokers list) is
-deliberately absent: SET's own 2026 page lists the 19 dates below and October is
-not a contract month, so it can never affect an expiry date.
+2026-10-16 (the IMF/WBG annual-meeting closure) is a full market closure.
+Verified against the exchange feed: TFEX published no daily statistics for
+2026-10-16 while 2026-10-14, 15, 19 and 20 were normal sessions. October is not
+a contract month, so it cannot shift a contract expiry, but the collector must
+not treat that day as a trading session.
 
 Only weekday closures belong in this set — `is_trading_day()` already excludes
 Saturday and Sunday.
@@ -30,7 +32,7 @@ import calendar
 import datetime
 
 SET_HOLIDAYS = frozenset({
-    # 2026 (19 weekday closures)
+    # 2026 (20 weekday closures)
     "2026-01-01",  # New Year's Day
     "2026-01-02",  # Additional special holiday
     "2026-03-03",  # Makha Bucha Day
@@ -46,6 +48,7 @@ SET_HOLIDAYS = frozenset({
     "2026-07-29",  # Asarnha Bucha Day
     "2026-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday
     "2026-10-13",  # King Bhumibol Adulyadej Memorial Day
+    "2026-10-16",  # Additional special holiday (IMF/WBG Annual Meetings)
     "2026-10-23",  # Chulalongkorn Day
     "2026-12-07",  # Substitution for Father's Day (Sat 5 Dec 2026)
     "2026-12-10",  # Constitution Day
