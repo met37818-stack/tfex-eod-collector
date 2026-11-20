@@ -52,7 +52,7 @@ Stateless Python EOD Data Collector สำหรับดึงข้อมู�
 
 ### การสั่งรันแบบ Manual (Workflow Dispatch):
 สามารถกด **Run workflow** ได้จากแท็บ Actions บน GitHub โดยมีตัวเลือก:
-- `force_run` (boolean): บังคับรันทันทีโดยไม่สนใจวันหยุดเสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ของตลาดหลักทรัพย์ฯ (`calendar_utils.SET_HOLIDAYS`)
+- `force_run` (boolean): บังคับรันทันทีโดยไม่สนใจวันหยุดเสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ของตลาดหลักทรัพย์ฯ (`tfex_common.calendar.SET_HOLIDAYS`)
 
 ---
 

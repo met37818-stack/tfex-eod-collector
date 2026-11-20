@@ -20,7 +20,7 @@ from greeks_engine import (
     calculate_black76_full_greeks,
     black76_price,
 )
-from calendar_utils import (
+from tfex_common.calendar import (
     SET_HOLIDAYS,
     get_penultimate_business_day,
     get_series_expiry_date,
@@ -150,9 +150,9 @@ class TestEODGreeksEngine(unittest.TestCase):
         # gave every one of its options a DTE one day too long.
         self.assertEqual(get_penultimate_business_day(2026, 12), datetime.date(2026, 12, 29))
         self.assertEqual(get_penultimate_business_day(2027, 12), datetime.date(2027, 12, 29))
-        self.assertEqual(get_series_expiry_date("S50Z26"), datetime.date(2026, 12, 29))
-        self.assertEqual(get_series_expiry_date("S50Z27"), datetime.date(2027, 12, 29))
-        self.assertEqual(get_series_expiry_date("H27"), datetime.date(2027, 3, 30))
+        self.assertEqual(get_series_expiry_date("S50Z26", datetime.date(2026, 11, 20)), datetime.date(2026, 12, 29))
+        self.assertEqual(get_series_expiry_date("S50Z27", datetime.date(2026, 11, 20)), datetime.date(2027, 12, 29))
+        self.assertEqual(get_series_expiry_date("H27", datetime.date(2026, 11, 20)), datetime.date(2027, 3, 30))
 
     def test_holiday_list_is_complete(self):
         # Official weekday closures: 20 in 2026, 18 in 2027 (set.or.th calendar).

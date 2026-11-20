@@ -20,7 +20,7 @@ import datetime
 from datetime import date, time
 from typing import Dict, List, Tuple, Any, Optional
 
-from calendar_utils import get_penultimate_business_day, get_series_expiry_date
+from tfex_common.calendar import get_penultimate_business_day, get_series_expiry_date
 
 # Thailand Timezone
 try:
@@ -29,7 +29,7 @@ try:
 except ImportError:
     BKK_TZ = datetime.timezone(datetime.timedelta(hours=7))
 
-# SET_HOLIDAYS lives in calendar_utils.py — see the module docstring there for
+# SET_HOLIDAYS lives in tfex_common.calendar (shared with every TFEX repo) — see that
 # why a single shared copy matters (this file used to carry an incomplete list,
 # which gave S50Z27 a different expiry than the collector computed).
 
@@ -166,8 +166,8 @@ def calculate_black76_full_greeks(
 # ==============================================================================
 # 2. CALENDAR & EXPIRY UTILITIES
 # ==============================================================================
-# SET_HOLIDAYS, get_penultimate_business_day() and get_series_expiry_date() are
-# imported from calendar_utils.py (one shared copy with eod_collector.py).
+# SET_HOLIDAYS, get_penultimate_business_day() and get_series_expiry_date() come
+# from tfex_common.calendar (one copy shared by all four TFEX repos).
 
 # ==============================================================================
 # 3. SCHEMA DDL FOR TURSO / SQLITE
@@ -299,7 +299,7 @@ def compute_greeks_records_for_date(
             continue
 
         # Expiry & DTE
-        expiry_date = get_series_expiry_date(series)
+        expiry_date = get_series_expiry_date(series, trade_date_obj)
         dte = max(0, (expiry_date - trade_date_obj).days)
         # Floor T at half a day so an expiry-day row (dte=0) does not divide by
         # zero. Consequence: greeks for dte=0 describe a 12-hour option, not an
