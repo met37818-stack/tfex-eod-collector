@@ -44,6 +44,7 @@ from tfex_common.calendar import (  # noqa: E402
     get_penultimate_business_day,
     is_trading_day,
 )
+from tfex_common.telegram import send_alert  # noqa: E402
 from tfex_common.turso import execute_pipeline  # noqa: E402
 from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
 from tfex_common.turso import to_arg as to_turso_arg  # noqa: E402
@@ -1065,6 +1066,44 @@ def run_tiered_retention_guard(
 run_fifo_retention_guard = run_tiered_retention_guard
 
 # ==============================================================================
+# STALE REFUSAL NOTIFIER
+# ==============================================================================
+#
+# The date guard exits 3 when TFEX has not published the expected trade_date. That
+# exit code is the only signal, and it lives in the Actions log - an unattended cron
+# failure therefore stayed invisible until somebody opened the run. TFEX publishes in
+# stages (investor types for T land hours before the settlement/series stats), so
+# this is a normal state late in the evening, and a silent red run is the wrong
+# signal for it. Notify once, best-effort, without ever masking the exit code.
+
+def format_stale_alert(target_date: str, collected_dates: list) -> str:
+    """Telegram body for a refused stale run, HTML-safe."""
+    latest = collected_dates[-1] if collected_dates else "no futures/option rows"
+    return (
+        "<b>EOD collector stopped: data not published yet</b>\n"
+        f"expected trade_date: <code>{target_date}</code>\n"
+        f"latest available: <code>{latest}</code>\n"
+        "Nothing was written. The next scheduled tick will retry."
+    )
+
+
+def notify_stale_refusal(target_date: str, collected_dates: list) -> bool:
+    """Send the stale refusal to Telegram. Never raises: exit 3 must stay exit 3."""
+    bot_token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if not bot_token or not chat_id:
+        print("[GUARD] No Telegram credentials configured; stale refusal not notified.")
+        return False
+    try:
+        sent = send_alert(bot_token, chat_id, format_stale_alert(target_date, collected_dates))
+    except Exception as exc:  # noqa: BLE001 - telemetry must never mask the exit code
+        print(f"[GUARD] Stale refusal notification failed: {type(exc).__name__}")
+        return False
+    print(f"[GUARD] Stale refusal notification {'sent' if sent else 'not sent'}.")
+    return sent
+
+
+# ==============================================================================
 # TELEGRAM EOD COMPLETION NOTIFIER
 # ==============================================================================
 
@@ -1434,6 +1473,7 @@ def main():
                 print("[GUARD] --allow-stale passed: continuing anyway (no success notification guarantee).")
             else:
                 print("[GUARD] Refusing to write/report stale data. Re-run with --allow-stale to override.")
+                notify_stale_refusal(target_date.isoformat(), collected_dates)
                 sys.exit(3)
 
     # 3.6 Options Collection Guard
