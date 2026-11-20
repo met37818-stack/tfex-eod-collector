@@ -17,7 +17,6 @@ import sys
 import re
 import json
 import time
-import calendar
 import argparse
 import datetime
 import urllib.parse
@@ -35,48 +34,10 @@ import pytz
 
 BKK_TZ = pytz.timezone("Asia/Bangkok")
 
-# Official SET Holidays (2026 - 2027)
-SET_HOLIDAYS = {
-    # 2026
-    "2026-01-01",  # New Year's Day
-    "2026-01-02",  # New Year Special Holiday
-    "2026-03-03",  # Makha Bucha Day
-    "2026-04-06",  # Chakri Memorial Day
-    "2026-04-13",  # Songkran Festival
-    "2026-04-14",  # Songkran Festival
-    "2026-04-15",  # Songkran Festival
-    "2026-05-01",  # National Labour Day
-    "2026-05-04",  # Coronation Day
-    "2026-06-01",  # Visakha Bucha Day
-    "2026-06-03",  # H.M. Queen Suthida's Birthday
-    "2026-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2026-07-29",  # Asahna Bucha Day
-    "2026-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday
-    "2026-10-13",  # King Bhumibol Adulyadej Memorial Day
-    "2026-10-23",  # Chulalongkorn Day
-    "2026-12-07",  # Substitution for King Bhumibol's Birthday
-    "2026-12-10",  # Constitution Day
-    "2026-12-31",  # New Year's Eve
-    # 2027
-    "2027-01-01",  # New Year's Day
-    "2027-02-22",  # Makha Bucha Day
-    "2027-04-06",  # Chakri Memorial Day
-    "2027-04-13",  # Songkran Festival
-    "2027-04-14",  # Songkran Festival
-    "2027-04-15",  # Songkran Festival
-    "2027-05-03",  # Substitution for National Labour Day
-    "2027-05-04",  # Coronation Day
-    "2027-05-20",  # Visakha Bucha Day
-    "2027-06-03",  # H.M. Queen Suthida's Birthday
-    "2027-07-19",  # Asahna Bucha Day
-    "2027-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2027-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday
-    "2027-10-13",  # King Bhumibol Adulyadej Memorial Day
-    "2027-10-25",  # Substitution for Chulalongkorn Day
-    "2027-12-06",  # Substitution for King Bhumibol's Birthday
-    "2027-12-10",  # Constitution Day
-    "2027-12-31",  # New Year's Eve
-}
+# Trading calendar (holidays + quarterly expiry) has a single source of truth in
+# calendar_utils.py. This file previously carried a private copy that drifted out
+# of sync with the greeks engine's copy.
+from calendar_utils import get_penultimate_business_day, is_trading_day  # noqa: E402
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -114,18 +75,6 @@ def load_dotenv(path: str = ".env"):
             except Exception as e:
                 print(f"[WARN] Could not parse .env at {p}: {e}")
 
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
-    """Calculates the penultimate business day of a contract month."""
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = []
-    for d in range(1, last_day + 1):
-        dt = datetime.date(year, month, d)
-        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
-            biz_days.append(dt)
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
-    return biz_days[-2]
-
 def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]:
     """
     Calculate the 2 active quarterly SET50 series (H: Mar, M: Jun, U: Sep, Z: Dec).
@@ -144,7 +93,7 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
 
     for yr in range(ref_time.year, ref_time.year + 3):
         for m in quarter_months:
-            penult_day = get_penultimate_business_day(yr, m, SET_HOLIDAYS)
+            penult_day = get_penultimate_business_day(yr, m)
             expiry_dt = BKK_TZ.localize(datetime.datetime(penult_day.year, penult_day.month, penult_day.day, 16, 30, 0))
             if ref_time <= expiry_dt:
                 series_code = f"S50{month_codes[m]}{str(yr)[-2:]}"
@@ -180,7 +129,7 @@ def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str
 
     if target_date.weekday() >= 5:
         return True, f"Target trade date {target_str} is a weekend ({weekday_name})"
-    if target_str in SET_HOLIDAYS:
+    if not is_trading_day(target_date):
         return True, f"Target trade date {target_str} is an official SET holiday"
 
     return False, f"Target trade date {target_str} is a valid trading session"

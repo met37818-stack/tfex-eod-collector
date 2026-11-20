@@ -15,11 +15,12 @@ Strict Fail-Loud / No Silent Defaults:
 import os
 import sys
 import math
-import calendar
 import argparse
 import datetime
 from datetime import date, time
 from typing import Dict, List, Tuple, Any, Optional
+
+from calendar_utils import get_penultimate_business_day, get_series_expiry_date
 
 # Thailand Timezone
 try:
@@ -28,13 +29,9 @@ try:
 except ImportError:
     BKK_TZ = datetime.timezone(datetime.timedelta(hours=7))
 
-# Standard TFEX SET Holidays for Expiry Calculation
-SET_HOLIDAYS = {
-    "2026-01-01", "2026-02-12", "2026-04-06", "2026-04-13", "2026-04-14", "2026-04-15",
-    "2026-05-01", "2026-05-04", "2026-05-18", "2026-06-03", "2026-07-28", "2026-07-29",
-    "2026-08-12", "2026-10-13", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
-    "2027-01-01"
-}
+# SET_HOLIDAYS lives in calendar_utils.py — see the module docstring there for
+# why a single shared copy matters (this file used to carry an incomplete list,
+# which gave S50Z27 a different expiry than the collector computed).
 
 # ==============================================================================
 # 1. MATHEMATICAL FORMULAS (PURE PYTHON STANDARD LIBRARY)
@@ -167,36 +164,8 @@ def calculate_black76_full_greeks(
 # ==============================================================================
 # 2. CALENDAR & EXPIRY UTILITIES
 # ==============================================================================
-
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
-    """Calculates the penultimate business day of a contract month."""
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = []
-    for d in range(1, last_day + 1):
-        dt = datetime.date(year, month, d)
-        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
-            biz_days.append(dt)
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
-    return biz_days[-2]
-
-def get_series_expiry_date(series_code: str, ref_date: datetime.date) -> datetime.date:
-    """
-    Extracts expiration date for quarterly series (e.g. S50Z26 or Z26 -> Dec 2026).
-    Quarter codes: H = March, M = June, U = September, Z = December.
-    """
-    code_map = {"H": 3, "M": 6, "U": 9, "Z": 12}
-    code = series_code.upper()
-    if code.startswith("S50"):
-        quarter_char = code[3]
-        year_suffix = int(code[4:6])
-    else:
-        quarter_char = code[0]
-        year_suffix = int(code[1:3])
-
-    quarter_month = code_map.get(quarter_char, 12)
-    full_year = 2000 + year_suffix
-    return get_penultimate_business_day(full_year, quarter_month)
+# SET_HOLIDAYS, get_penultimate_business_day() and get_series_expiry_date() are
+# imported from calendar_utils.py (one shared copy with eod_collector.py).
 
 # ==============================================================================
 # 3. SCHEMA DDL FOR TURSO / SQLITE
@@ -328,7 +297,7 @@ def compute_greeks_records_for_date(
             continue
 
         # Expiry & DTE
-        expiry_date = get_series_expiry_date(series, trade_date_obj)
+        expiry_date = get_series_expiry_date(series)
         dte = max(0, (expiry_date - trade_date_obj).days)
         T_years = max(dte, 0.5) / 365.0
 

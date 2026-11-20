@@ -13,8 +13,8 @@ from greeks_engine import (
     calculate_implied_vol,
     calculate_black76_full_greeks,
     black76_price,
-    get_penultimate_business_day
 )
+from calendar_utils import SET_HOLIDAYS, get_penultimate_business_day, get_series_expiry_date
 from eod_collector import run_tiered_retention_guard, get_active_quarterly_series
 
 
@@ -128,6 +128,21 @@ class TestEODGreeksEngine(unittest.TestCase):
         self.assertEqual(p_day.strftime("%Y-%m-%d"), "2026-12-29")
         active = get_active_quarterly_series(datetime.datetime(2026, 11, 20, 10, 0, 0))
         self.assertEqual(active[0], "S50Z26")
+
+    def test_expiry_matches_set_calendar(self):
+        # Single shared calendar. The greeks engine used to carry its own 19-entry
+        # copy with no 2027 holidays at all, so it dated S50Z27 to 2027-12-30 and
+        # gave every one of its options a DTE one day too long.
+        self.assertEqual(get_penultimate_business_day(2026, 12), datetime.date(2026, 12, 29))
+        self.assertEqual(get_penultimate_business_day(2027, 12), datetime.date(2027, 12, 29))
+        self.assertEqual(get_series_expiry_date("S50Z26"), datetime.date(2026, 12, 29))
+        self.assertEqual(get_series_expiry_date("S50Z27"), datetime.date(2027, 12, 29))
+        self.assertEqual(get_series_expiry_date("H27"), datetime.date(2027, 3, 30))
+
+    def test_holiday_list_is_complete(self):
+        # Official weekday closures: 19 in 2026, 18 in 2027 (set.or.th calendar).
+        self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2026-")]), 19)
+        self.assertEqual(len([d for d in SET_HOLIDAYS if d.startswith("2027-")]), 18)
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):
