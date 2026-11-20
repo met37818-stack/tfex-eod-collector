@@ -341,6 +341,46 @@ class TestTelegramTokenHygiene(unittest.TestCase):
                 os.unlink(tmp.name)
 
 
+class TestRetentionReporting(unittest.TestCase):
+    """A DELETE whose row count cannot be confirmed must not be reported as 0."""
+
+    def test_pipeline_affected_rows(self):
+        import eod_collector as ec
+
+        self.assertEqual(
+            ec._pipeline_affected_rows({"type": "ok", "response": {"result": {"affected_row_count": 7}}}),
+            7,
+        )
+        self.assertIsNone(ec._pipeline_affected_rows({"type": "error", "error": {"message": "no such table"}}))
+        self.assertIsNone(ec._pipeline_affected_rows({"type": "ok", "response": {"result": {}}}))
+
+    def test_format_deleted_marks_failure_not_zero(self):
+        import eod_collector as ec
+
+        self.assertIn("ล้มเหลว", ec._format_deleted(None))
+        self.assertEqual(ec._format_deleted(0), "0 แถวถูกลบ")
+        self.assertEqual(ec._format_deleted(12), "12 แถวถูกลบ")
+
+    def test_missing_tables_report_zero_not_failure(self):
+        import eod_collector as ec
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE spot_snapshots (captured_at_bkk TEXT, last REAL);")
+            conn.execute("INSERT INTO spot_snapshots VALUES ('2020-01-01 00:00:00', 900.0);")
+            conn.commit()
+            conn.close()
+
+            result = ec.run_tiered_retention_guard(db_file=tmp.name, ref_date=datetime.date(2026, 11, 19))
+            self.assertEqual(result["options_snapshots"], 0, "absent table is 0, not a failure")
+            self.assertEqual(result["spot_snapshots"], 1, "count comes from the DELETE rowcount")
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+
+
 class TestTieredRetentionPolicy(unittest.TestCase):
 
     def setUp(self):

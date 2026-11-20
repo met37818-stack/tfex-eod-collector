@@ -912,6 +912,29 @@ INTRADAY_TABLES = [
     "options_snapshots"
 ]
 
+def _pipeline_affected_rows(result: dict) -> Optional[int]:
+    """Rows a libSQL HTTP-pipeline execute result actually modified.
+
+    Returns None when the statement failed or the endpoint did not report a
+    count — callers must treat None as "unknown/failed", never as zero.
+    """
+    if not isinstance(result, dict) or result.get("type") != "ok":
+        return None
+    payload = (result.get("response") or {}).get("result") or {}
+    affected = payload.get("affected_row_count")
+    if affected is None:
+        return None
+    try:
+        return int(affected)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_deleted(value: Optional[int]) -> str:
+    """Human/Telegram-safe rendering: an unknown count is a failure, not 0."""
+    return "⚠️ ล้มเหลว" if value is None else f"{value:,} แถวถูกลบ"
+
+
 def run_tiered_retention_guard(
     pipeline_url: str = None,
     auth_token: str = None,
@@ -923,7 +946,10 @@ def run_tiered_retention_guard(
     1. options_snapshots (Tier 1): Retain 14 days; delete rows where captured_at_bkk < date('now', '-14 days').
     2. futures_snapshots & spot_snapshots (Tier 2): Retain 90 days; delete rows where captured_at_bkk < date('now', '-90 days').
     3. All eod_* tables & daily_realized_vol (Tier 3): STRICTLY PERMANENT; never deleted.
-    Returns dictionary with deleted rows count per table and cutoff timestamps.
+
+    Deleted counts come from the DELETE itself (affected_row_count / rowcount).
+    A count that cannot be confirmed is reported as None — the previous version
+    pre-counted the rows, so a failed DELETE still printed "N rows deleted".
     """
     now_bkk = datetime.datetime.now(BKK_TZ)
     base_date = ref_date or now_bkk.date()
@@ -934,10 +960,10 @@ def run_tiered_retention_guard(
     cutoff_options_str = cutoff_options_date.strftime("%Y-%m-%d 00:00:00")
     cutoff_futures_spot_str = cutoff_futures_spot_date.strftime("%Y-%m-%d 00:00:00")
 
-    deleted_counts = {
-        "options_snapshots": 0,
-        "futures_snapshots": 0,
-        "spot_snapshots": 0,
+    deleted_counts: Dict[str, Any] = {
+        "options_snapshots": None,
+        "futures_snapshots": None,
+        "spot_snapshots": None,
         "cutoff_options": cutoff_options_str,
         "cutoff_futures_spot": cutoff_futures_spot_str
     }
@@ -957,32 +983,6 @@ def run_tiered_retention_guard(
             "Authorization": f"Bearer {auth_token}",
             "Content-Type": "application/json"
         }
-        cnt_reqs = [
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
-            {"type": "close"}
-        ]
-        try:
-            r_cnt = requests.post(pipeline_url, headers=headers, json={"requests": cnt_reqs}, timeout=20)
-            if r_cnt.status_code == 200:
-                res = r_cnt.json()
-                results = res.get("results", [])
-                if len(results) >= 1 and results[0].get("type") == "ok":
-                    rows = results[0]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["options_snapshots"] = int(rows[0][0]["value"])
-                if len(results) >= 2 and results[1].get("type") == "ok":
-                    rows = results[1]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["futures_snapshots"] = int(rows[0][0]["value"])
-                if len(results) >= 3 and results[2].get("type") == "ok":
-                    rows = results[2]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["spot_snapshots"] = int(rows[0][0]["value"])
-        except Exception as e:
-            print(f"[RETENTION] Warning: Failed to pre-count rows in Turso: {e}")
-
         del_reqs = [
             {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
             {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
@@ -993,19 +993,26 @@ def run_tiered_retention_guard(
         ]
         try:
             r_del = requests.post(pipeline_url, headers=headers, json={"requests": del_reqs}, timeout=30)
-            if r_del.status_code == 200:
-                res_del = r_del.json()
-                results = res_del.get("results", [])
+            if r_del.status_code != 200:
+                print(f"[RETENTION] ERROR: Turso retention pipeline failed (HTTP {r_del.status_code})")
+            else:
+                results = r_del.json().get("results", [])
+                for idx, key in enumerate(("options_snapshots", "futures_snapshots", "spot_snapshots")):
+                    if idx >= len(results):
+                        print(f"[RETENTION] ERROR: no result for {key} DELETE")
+                        continue
+                    affected = _pipeline_affected_rows(results[idx])
+                    if affected is None:
+                        print(f"[RETENTION] ERROR: {key} DELETE did not report an affected row count")
+                    deleted_counts[key] = affected
                 if len(results) >= 5:
-                    pc_res = results[3]
-                    ps_res = results[4]
+                    pc_res, ps_res = results[3], results[4]
                     if pc_res.get("type") == "ok" and ps_res.get("type") == "ok":
                         pc = int(pc_res["response"]["result"]["rows"][0][0]["value"])
                         ps = int(ps_res["response"]["result"]["rows"][0][0]["value"])
-                        new_mb = (pc * ps) / (1024 * 1024)
-                        print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
+                        print(f"[RETENTION] Post-cleanup DB Size: {(pc * ps) / (1024 * 1024):.2f} MB")
         except Exception as e:
-            print(f"[RETENTION] Error executing Turso tiered retention delete: {e}")
+            print(f"[RETENTION] Error executing Turso tiered retention delete: {type(e).__name__}: {e}")
     else:
         target_db = db_file or "eod_tfex.db"
         if os.path.exists(target_db):
@@ -1015,20 +1022,16 @@ def run_tiered_retention_guard(
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 existing_tables = set(row[0] for row in cur.fetchall())
 
-                if "options_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
-                    deleted_counts["options_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
-
-                if "futures_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-                    deleted_counts["futures_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-
-                if "spot_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-                    deleted_counts["spot_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+                for key, table, cutoff in (
+                    ("options_snapshots", "options_snapshots", cutoff_options_str),
+                    ("futures_snapshots", "futures_snapshots", cutoff_futures_spot_str),
+                    ("spot_snapshots", "spot_snapshots", cutoff_futures_spot_str),
+                ):
+                    if table not in existing_tables:
+                        deleted_counts[key] = 0
+                        continue
+                    cur.execute(f"DELETE FROM {table} WHERE captured_at_bkk < ?;", (cutoff,))
+                    deleted_counts[key] = cur.rowcount
 
                 conn.commit()
                 try:
@@ -1040,15 +1043,16 @@ def run_tiered_retention_guard(
                 cur.execute("PRAGMA page_size;")
                 ps = cur.fetchone()[0]
                 conn.close()
-                new_mb = (pc * ps) / (1024 * 1024)
-                print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
+                print(f"[RETENTION] Post-cleanup DB Size: {(pc * ps) / (1024 * 1024):.2f} MB")
             except Exception as e:
-                print(f"[RETENTION] Error executing local SQLite tiered retention delete: {e}")
+                print(f"[RETENTION] Error executing local SQLite tiered retention delete: {type(e).__name__}: {e}")
+        else:
+            print(f"[RETENTION] Local database {target_db} not found; nothing to purge.")
 
     print(f"[RETENTION] Summary of purged records:")
-    print(f"  • options_snapshots (14d limit): {deleted_counts['options_snapshots']:,} rows deleted")
-    print(f"  • futures_snapshots (90d limit): {deleted_counts['futures_snapshots']:,} rows deleted")
-    print(f"  • spot_snapshots    (90d limit): {deleted_counts['spot_snapshots']:,} rows deleted")
+    print(f"  • options_snapshots (14d limit): {_format_deleted(deleted_counts['options_snapshots'])}")
+    print(f"  • futures_snapshots (90d limit): {_format_deleted(deleted_counts['futures_snapshots'])}")
+    print(f"  • spot_snapshots    (90d limit): {_format_deleted(deleted_counts['spot_snapshots'])}")
     print(f"  • eod_* & daily_realized_vol:    0 rows deleted (Strict Permanent Protection)")
     return deleted_counts
 
@@ -1242,14 +1246,14 @@ def send_eod_telegram_alert(
 
     ret_text = ""
     if retention_stats:
-        opt_del = retention_stats.get("options_snapshots", 0)
-        fut_del = retention_stats.get("futures_snapshots", 0)
-        spt_del = retention_stats.get("spot_snapshots", 0)
+        opt_del = retention_stats.get("options_snapshots")
+        fut_del = retention_stats.get("futures_snapshots")
+        spt_del = retention_stats.get("spot_snapshots")
         ret_text = (
             f"\n\n<b>🧹 Tiered Retention Maintenance:</b>\n"
-            f"• <b>options_snapshots (14d)</b>: <code>{opt_del:,}</code> แถวถูกลบ\n"
-            f"• <b>futures_snapshots (90d)</b>: <code>{fut_del:,}</code> แถวถูกลบ\n"
-            f"• <b>spot_snapshots (90d)</b>: <code>{spt_del:,}</code> แถวถูกลบ\n"
+            f"• <b>options_snapshots (14d)</b>: {_format_deleted(opt_del)}\n"
+            f"• <b>futures_snapshots (90d)</b>: {_format_deleted(fut_del)}\n"
+            f"• <b>spot_snapshots (90d)</b>: {_format_deleted(spt_del)}\n"
             f"• <b>eod_* & daily_realized_vol</b>: <code>ถาวร (ห้ามลบ)</code>"
         )
 
