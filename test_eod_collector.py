@@ -567,3 +567,40 @@ class TestTieredRetentionPolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestTursoBatchWriter(unittest.TestCase):
+    """
+    execute_turso_pipeline() keeps the chunking + progress output and hands the
+    transport to tfex_common.turso.execute_pipeline(). These pin the payload shape
+    (must match what the old hand-rolled client sent) and the chunk boundaries.
+    """
+
+    def _stmts(self, n):
+        return [{"sql": f"INSERT INTO t VALUES ({i});", "args": [i, "x"]} for i in range(n)]
+
+    def test_chunking_and_payload(self):
+        from unittest.mock import patch as _patch
+        import eod_collector as ec
+
+        stmts = self._stmts(250)
+        calls = []
+        with _patch.object(ec, "execute_pipeline", side_effect=lambda url, tok, payload=None, timeout=None: calls.append(payload)):
+            ec.execute_turso_pipeline("https://db/v2/pipeline", "tok", stmts, batch_size=100)
+
+        self.assertEqual(len(calls), 3, "250 statements in batches of 100 -> 3 calls")
+        sizes = [len(c["requests"]) for c in calls]
+        self.assertEqual(sizes, [101, 101, 51], "100/100/50 statements + one close each")
+        first = calls[0]["requests"][0]
+        self.assertEqual(first["type"], "execute")
+        self.assertEqual(first["stmt"]["sql"], "INSERT INTO t VALUES (0);")
+        self.assertEqual(first["stmt"]["args"], [{"type": "integer", "value": "0"},
+                                                 {"type": "text", "value": "x"}])
+        self.assertEqual(calls[0]["requests"][-1], {"type": "close"})
+
+    def test_transport_error_propagates(self):
+        from unittest.mock import patch as _patch
+        import eod_collector as ec
+
+        with _patch.object(ec, "execute_pipeline", side_effect=RuntimeError("Turso pipeline failed (HTTP 500)")):
+            with self.assertRaises(RuntimeError):
+                ec.execute_turso_pipeline("https://db/v2/pipeline", "tok", self._stmts(3))

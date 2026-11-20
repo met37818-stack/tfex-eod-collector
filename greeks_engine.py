@@ -21,6 +21,8 @@ from datetime import date, time
 from typing import Dict, List, Tuple, Any, Optional
 
 from tfex_common.calendar import get_penultimate_business_day, get_series_expiry_date
+from tfex_common.thor import select_dynamic_thor_rate
+from tfex_common.turso import to_arg as to_turso_arg
 
 # Thailand Timezone
 try:
@@ -207,56 +209,6 @@ CREATE TABLE IF NOT EXISTS eod_options_greeks (
 THOR_MAX_PCT = 20.0
 
 
-def select_dynamic_thor_rate(
-    thor_record: Dict[str, Optional[float]],
-    dte: int
-) -> Tuple[float, str]:
-    """
-    Selects dynamic THOR rate matching the option's DTE (Days to Expiration).
-    
-    Tenor Selection Rules:
-    - dte <= 30 days:
-        Prefer 1M Compounded ('1m')
-        Fallback: Overnight ('overnight')
-    - 30 < dte <= 90 days:
-        Prefer 3M Compounded ('3m')
-        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
-    - 90 < dte <= 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
-    - dte > 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded -> Overnight
-    """
-    def _to_decimal_rate(pct: Optional[float], tenor: str) -> Optional[float]:
-        """BOT publishes THOR in percent (1.25 == 1.25% p.a.). Always divide by 100."""
-        if pct is None or pct <= 0:
-            return None
-        if pct > THOR_MAX_PCT:
-            raise ValueError(
-                f"THOR {tenor} out of range: {pct} (expected percent, <= {THOR_MAX_PCT})"
-            )
-        return pct / 100.0
-
-    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
-    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
-    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
-    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
-
-    if dte <= 30:
-        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
-    elif dte <= 90:
-        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
-    elif dte <= 180:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
-    else:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
-
-    for label, rate in candidates:
-        if rate is not None and rate > 0:
-            return rate, label
-
-    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
 
 
 def compute_greeks_records_for_date(
@@ -383,16 +335,6 @@ def compute_greeks_records_for_date(
 # 5. PIPELINE EXECUTION FOR TURSO & LOCAL SQLITE
 # ==============================================================================
 
-def to_turso_arg(val: Any) -> Dict[str, Any]:
-    if val is None:
-        return {"type": "null"}
-    if isinstance(val, int):
-        return {"type": "integer", "value": val}
-    if isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
-            return {"type": "null"}
-        return {"type": "float", "value": val}
-    return {"type": "text", "value": str(val)}
 
 def run_eod_greeks_pipeline(
     pipeline_url: Optional[str] = None,
