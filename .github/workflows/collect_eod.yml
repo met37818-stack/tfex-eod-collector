@@ -8,6 +8,11 @@ on:
         type: boolean
         default: false
         required: false
+      allow_stale:
+        description: 'Continue when TFEX has not published the expected trade_date yet (21:00 ICT warm-up tick)'
+        type: boolean
+        default: false
+        required: false
 
 jobs:
   collect-eod:
@@ -36,8 +41,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          ARGS=""
           if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
-            python eod_collector.py --force
-          else
-            python eod_collector.py
+            ARGS="$ARGS --force"
           fi
+          if [ "${{ github.event.inputs.allow_stale }}" = "true" ]; then
+            ARGS="$ARGS --allow-stale"
+          fi
+          echo "running: python eod_collector.py $ARGS"
+          python eod_collector.py $ARGS
