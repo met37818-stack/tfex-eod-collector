@@ -229,6 +229,13 @@ CREATE TABLE IF NOT EXISTS eod_options_greeks (
 # 4. GREEKS PROCESSING ENGINE
 # ==============================================================================
 
+# BOT publishes THOR in percent (1.25 == 1.25% p.a.). Never infer the unit from
+# the magnitude of the number: a genuine sub-0.5% rate (or a 6M average in a
+# steep cutting cycle) used to be read as a decimal and inflated x100, silently
+# corrupting IV and every downstream greek.
+THOR_MAX_PCT = 20.0
+
+
 def select_dynamic_thor_rate(
     thor_record: Dict[str, Optional[float]],
     dte: int
@@ -250,15 +257,20 @@ def select_dynamic_thor_rate(
         Prefer 6M Compounded ('6m')
         Fallback: 3M Compounded -> Overnight
     """
-    def _clean(val: Optional[float]) -> Optional[float]:
-        if val is None or val <= 0:
+    def _to_decimal_rate(pct: Optional[float], tenor: str) -> Optional[float]:
+        """BOT publishes THOR in percent (1.25 == 1.25% p.a.). Always divide by 100."""
+        if pct is None or pct <= 0:
             return None
-        return val / 100.0 if val > 0.5 else val
+        if pct > THOR_MAX_PCT:
+            raise ValueError(
+                f"THOR {tenor} out of range: {pct} (expected percent, <= {THOR_MAX_PCT})"
+            )
+        return pct / 100.0
 
-    r_on = _clean(thor_record.get("overnight"))
-    r_1m = _clean(thor_record.get("1m"))
-    r_3m = _clean(thor_record.get("3m"))
-    r_6m = _clean(thor_record.get("6m"))
+    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
+    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
+    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
+    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
 
     if dte <= 30:
         candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]

@@ -12,6 +12,7 @@ from greeks_engine import (
     compute_greeks_records_for_date,
     calculate_implied_vol,
     calculate_black76_full_greeks,
+    black76_price,
     get_penultimate_business_day
 )
 from eod_collector import run_tiered_retention_guard, get_active_quarterly_series
@@ -23,6 +24,24 @@ class TestEODGreeksEngine(unittest.TestCase):
         empty_thor = {"overnight": None, "1m": None, "3m": None, "6m": None}
         with self.assertRaises(ValueError):
             select_dynamic_thor_rate(empty_thor, dte=30)
+
+    def test_thor_percent_is_always_converted(self):
+        # BOT publishes THOR in percent. The old magnitude heuristic (>0.5 means
+        # percent, otherwise decimal) read a real 0.45% rate as r=0.45 (45% p.a.).
+        self.assertAlmostEqual(select_dynamic_thor_rate({"overnight": 1.25}, 10)[0], 0.0125)
+        self.assertAlmostEqual(select_dynamic_thor_rate({"overnight": 0.45}, 10)[0], 0.0045)
+        self.assertAlmostEqual(select_dynamic_thor_rate({"overnight": 0.50}, 10)[0], 0.0050)
+        self.assertAlmostEqual(select_dynamic_thor_rate({"overnight": 0.05}, 10)[0], 0.0005)
+        with self.assertRaises(ValueError):
+            select_dynamic_thor_rate({"overnight": 45.0}, 10)
+
+    def test_iv_recovers_true_sigma_with_low_rate(self):
+        # Regression for the x100 rate bug: a 60-day OTM option priced at a true
+        # 25% vol and a 0.45% rate must solve back to 25%, not ~26.3%.
+        F, K, T, sigma = 920.0, 950.0, 60 / 365.0, 0.25
+        price = black76_price(F, K, T, 0.0045, sigma, "C")
+        iv = calculate_implied_vol(price, F, K, T, 0.0045, "C")
+        self.assertAlmostEqual(iv, sigma, delta=1e-3)
 
     def test_greeks_strict_settlement_price_only(self):
         # When settlement_price is None or 0, even if close has a price,
@@ -39,7 +58,9 @@ class TestEODGreeksEngine(unittest.TestCase):
             }
         ]
         futures_dict = {"Z26": 920.0, "S50Z26": 920.0}
-        thor_dict = {"overnight": 0.02, "1m": 0.021, "3m": 0.022, "6m": 0.023}
+        # THOR values are percent (BOT publishes 1.25 == 1.25% p.a.). This fixture
+        # used decimal values before the unit bug was fixed.
+        thor_dict = {"overnight": 2.0, "1m": 2.1, "3m": 2.2, "6m": 2.3}
 
         recs, val_cnt, inv_cnt = compute_greeks_records_for_date(
             trade_date="2026-11-19",
