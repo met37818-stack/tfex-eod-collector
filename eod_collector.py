@@ -103,11 +103,20 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
                     return active_series
     return active_series
 
-def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str]:
+def resolve_target_trade_date(
+    ref_time: datetime.datetime = None,
+) -> tuple[datetime.date, bool, str]:
     """
-    Determine if target trade session is a weekend or SET holiday.
-    If run before 09:00 ICT, target session is T-1.
-    If run at or after 09:00 ICT, target session is T.
+    Resolve the trade session this run is supposed to collect.
+
+    Before 09:00 ICT the relevant session is the previous trading day (Monday
+    morning looks back three days to Friday); at or after 09:00 it is the same
+    day. README states this date invariant explicitly — the fetched rows carry
+    their real trade_date and the clock's date is never used to label them.
+
+    Returns (target_date, is_non_trading, reason). `is_non_trading` means the
+    target date is itself a weekend or SET holiday, so there is no session to
+    collect for it.
     """
     if ref_time is None:
         ref_time = datetime.datetime.now(BKK_TZ)
@@ -129,11 +138,12 @@ def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str
     weekday_name = target_date.strftime("%A")
 
     if target_date.weekday() >= 5:
-        return True, f"Target trade date {target_str} is a weekend ({weekday_name})"
+        return target_date, True, f"Target trade date {target_str} is a weekend ({weekday_name})"
     if not is_trading_day(target_date):
-        return True, f"Target trade date {target_str} is an official SET holiday"
+        return target_date, True, f"Target trade date {target_str} is an official SET holiday"
 
-    return False, f"Target trade date {target_str} is a valid trading session"
+    return target_date, False, f"Target trade date {target_str} is a valid trading session"
+
 
 def clean_int(val) -> int:
     """Safe integer parser handling commas, signs, and blanks."""
@@ -1339,6 +1349,11 @@ def main():
         help="Force send Telegram completion alert regardless of time window or prior notification"
     )
     parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Continue when TFEX has not published the expected trade_date yet (skips the date invariant guard)"
+    )
+    parser.add_argument(
         "--local-db",
         type=str,
         default=None,
@@ -1358,8 +1373,8 @@ def main():
     print("=" * 70)
 
     # 1. Holiday & Weekend Guard
-    is_holiday, reason = is_holiday_or_weekend(now_bkk)
-    if is_holiday:
+    target_date, is_non_trading, reason = resolve_target_trade_date(now_bkk)
+    if is_non_trading:
         print(f"[GUARD] {reason}.")
         if not (args.force or args.notify):
             print("[GUARD] Skipping execution. (Use --force or --notify to run anyway).")
@@ -1367,7 +1382,7 @@ def main():
         else:
             print("[GUARD] Override flag detected (--force / --notify). Proceeding with execution.")
     else:
-        print(f"[GUARD] Check passed: {reason}.")
+        print(f"[GUARD] Check passed: {reason}. Expected trade_date={target_date.isoformat()}.")
 
     # 2. Determine Active Quarterly Series
     active_series = get_active_quarterly_series(now_bkk)
@@ -1385,6 +1400,26 @@ def main():
 
     elapsed_collect = time.time() - start_time
     print(f"[COLLECT] Data extraction completed in {elapsed_collect:.2f} seconds.")
+
+    # 3.5 Date Invariant Guard
+    # Rows carry the trade_date the exchange published, never the clock's date.
+    # Without this check a run against a not-yet-updated TFEX page re-upserted
+    # yesterday's rows and then announced "EOD complete" on Telegram for that
+    # stale date. Exit 3 so the external cron trigger can see the failure.
+    if not is_non_trading:
+        collected_dates = sorted({
+            r["trade_date"] for r in (fut_series + opt_series) if r.get("trade_date")
+        })
+        if target_date.isoformat() not in collected_dates:
+            print(
+                f"[GUARD] STALE: expected trade_date {target_date.isoformat()} but TFEX returned "
+                f"{collected_dates or 'no futures/options rows'}."
+            )
+            if args.allow_stale:
+                print("[GUARD] --allow-stale passed: continuing anyway (no success notification guarantee).")
+            else:
+                print("[GUARD] Refusing to write/report stale data. Re-run with --allow-stale to override.")
+                sys.exit(3)
 
     # 4. Generate Idempotent Upsert Statements
     statements = build_upsert_statements(

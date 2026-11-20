@@ -19,7 +19,11 @@ from greeks_engine import (
     black76_price,
 )
 from calendar_utils import SET_HOLIDAYS, get_penultimate_business_day, get_series_expiry_date
-from eod_collector import run_tiered_retention_guard, get_active_quarterly_series
+from eod_collector import (
+    get_active_quarterly_series,
+    resolve_target_trade_date,
+    run_tiered_retention_guard,
+)
 
 
 class TestEODGreeksEngine(unittest.TestCase):
@@ -168,6 +172,35 @@ class TestWorkerSessions(unittest.TestCase):
         thread.join()
 
         self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
+
+
+class TestTargetTradeDate(unittest.TestCase):
+    """The trade_date a run must collect, before any network call."""
+
+    def test_evening_run_targets_same_day(self):
+        target, non_trading, _ = resolve_target_trade_date(datetime.datetime(2026, 11, 20, 21, 0))
+        self.assertEqual(target, datetime.date(2026, 11, 20))
+        self.assertFalse(non_trading)
+
+    def test_early_morning_run_targets_previous_session(self):
+        for hour, minute in ((1, 0), (6, 15)):
+            target, non_trading, reason = resolve_target_trade_date(
+                datetime.datetime(2026, 11, 23, hour, minute)
+            )
+            self.assertEqual(target, datetime.date(2026, 11, 20), reason)  # Friday
+            self.assertFalse(non_trading)
+
+    def test_weekend_target_is_non_trading(self):
+        target, non_trading, reason = resolve_target_trade_date(datetime.datetime(2026, 11, 21, 9, 0))
+        self.assertEqual(target, datetime.date(2026, 11, 21))
+        self.assertTrue(non_trading)
+        self.assertIn("weekend", reason)
+
+    def test_holiday_target_is_non_trading(self):
+        target, non_trading, reason = resolve_target_trade_date(datetime.datetime(2026, 12, 31, 10, 0))
+        self.assertEqual(target, datetime.date(2026, 12, 31))
+        self.assertTrue(non_trading)
+        self.assertIn("holiday", reason)
 
 
 class TestRetryHelper(unittest.TestCase):
