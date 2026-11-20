@@ -1,4 +1,7 @@
 # Development / one-off tooling. Not installed by the GitHub Actions workflow.
 # backfill_from_excel.py needs openpyxl; the collector itself does not.
+# pytest: test_eod_collector.py needs it, and a fresh clone that installed only
+# requirements.txt could not run the suite at all (fixed 2026-11-21).
 -r requirements.txt
 openpyxl==3.1.5
+pytest==9.2.0
