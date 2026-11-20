@@ -7,8 +7,14 @@ import sqlite3
 import tempfile
 import unittest
 
-from greeks_engine import select_dynamic_thor_rate, compute_greeks_records_for_date
-from eod_collector import run_tiered_retention_guard
+from greeks_engine import (
+    select_dynamic_thor_rate,
+    compute_greeks_records_for_date,
+    calculate_implied_vol,
+    calculate_black76_full_greeks,
+    get_penultimate_business_day
+)
+from eod_collector import run_tiered_retention_guard, get_active_quarterly_series
 
 
 class TestEODGreeksEngine(unittest.TestCase):
@@ -72,6 +78,35 @@ class TestEODGreeksEngine(unittest.TestCase):
                 thor_rate=None,
                 now_bkk_str="2026-11-19 18:00:00 ICT"
             )
+
+    def test_iv_capped_at_150_pct(self):
+        # Deep OTM or unrealistic price should not return IV > 1.50
+        F = 920.0
+        K = 1100.0  # Far OTM Call
+        T = 30.0 / 365.0
+        r = 0.02
+        # A high price for far OTM call requires absurd IV > 150%
+        unrealistic_price = 100.0
+        iv = calculate_implied_vol(unrealistic_price, F, K, T, r, "C")
+        self.assertIsNone(iv, "IV exceeding 1.50 (150%) must return None")
+
+    def test_charm_dampened_at_low_dte(self):
+        # When DTE <= 2, charm should be capped within [-5.0, 5.0]
+        F = 920.0
+        K = 920.0
+        T = 1.0 / 365.0  # DTE = 1
+        r = 0.02
+        sigma = 0.15
+        greeks = calculate_black76_full_greeks(F, K, T, r, sigma, "C")
+        self.assertLessEqual(abs(greeks["charm"]), 5.0)
+
+    def test_active_quarterly_series_penultimate_business_day(self):
+        # In Dec 2026, penultimate business day is 2026-12-29
+        # Check active quarterly discovery
+        p_day = get_penultimate_business_day(2026, 12)
+        self.assertEqual(p_day.strftime("%Y-%m-%d"), "2026-12-29")
+        active = get_active_quarterly_series(datetime.datetime(2026, 11, 20, 10, 0, 0))
+        self.assertEqual(active[0], "S50Z26")
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):

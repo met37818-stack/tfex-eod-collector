@@ -114,18 +114,22 @@ def load_dotenv(path: str = ".env"):
             except Exception as e:
                 print(f"[WARN] Could not parse .env at {p}: {e}")
 
-def get_last_thursday(year: int, month: int) -> int:
-    """Find the day of the last Thursday of a given month."""
+def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
+    """Calculates the penultimate business day of a contract month."""
     _, last_day = calendar.monthrange(year, month)
-    for day in range(last_day, 0, -1):
-        if calendar.weekday(year, month, day) == calendar.THURSDAY:
-            return day
-    raise ValueError(f"Could not determine last Thursday for {year}-{month:02d}")
+    biz_days = []
+    for d in range(1, last_day + 1):
+        dt = datetime.date(year, month, d)
+        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
+            biz_days.append(dt)
+    if len(biz_days) < 2:
+        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
+    return biz_days[-2]
 
 def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]:
     """
     Calculate the 2 active quarterly SET50 series (H: Mar, M: Jun, U: Sep, Z: Dec).
-    Expiry: Last Thursday of the quarter month at 16:30 ICT.
+    Expiry: Penultimate business day of the quarter month at 16:30 ICT.
     """
     if ref_time is None:
         ref_time = datetime.datetime.now(BKK_TZ)
@@ -140,8 +144,8 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
 
     for yr in range(ref_time.year, ref_time.year + 3):
         for m in quarter_months:
-            last_thu = get_last_thursday(yr, m)
-            expiry_dt = BKK_TZ.localize(datetime.datetime(yr, m, last_thu, 16, 30, 0))
+            penult_day = get_penultimate_business_day(yr, m, SET_HOLIDAYS)
+            expiry_dt = BKK_TZ.localize(datetime.datetime(penult_day.year, penult_day.month, penult_day.day, 16, 30, 0))
             if ref_time <= expiry_dt:
                 series_code = f"S50{month_codes[m]}{str(yr)[-2:]}"
                 active_series.append(series_code)

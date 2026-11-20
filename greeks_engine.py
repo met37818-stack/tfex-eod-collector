@@ -84,24 +84,26 @@ def calculate_implied_vol(price: float, F: float, K: float, T: float, r: float, 
     if price <= intrinsic + 1e-4:
         return None
 
-    # Check boundary condition at high volatility (sigma = 5.0)
-    p_high = black76_price(F, K, T, r, 5.0, option_type)
+    # Cap Implied Volatility search at 1.50 (150%) to prevent deep OTM/ITM numerical blowup
+    MAX_IV = 1.50
+    p_high = black76_price(F, K, T, r, MAX_IV, option_type)
     if price >= p_high:
         return None
 
     low = 0.0001
-    high = 5.0
+    high = MAX_IV
     for _ in range(80):
         mid = 0.5 * (low + high)
         p_mid = black76_price(F, K, T, r, mid, option_type)
         diff = p_mid - price
         if abs(diff) < 1e-5:
-            return mid
+            return mid if mid <= MAX_IV else None
         if diff < 0.0:
             low = mid
         else:
             high = mid
-    return 0.5 * (low + high)
+    res = 0.5 * (low + high)
+    return res if (res is not None and res <= MAX_IV) else None
 
 def calculate_black76_full_greeks(
     F: float,
@@ -145,6 +147,10 @@ def calculate_black76_full_greeks(
         theta_1d = theta_raw / 365.0
         charm_raw = -r * disc * norm_cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))
         charm_1d = charm_raw / 365.0
+
+    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry 1/T asymptotic explosion
+    if T <= (2.0 / 365.0) or math.isnan(charm_1d) or math.isinf(charm_1d):
+        charm_1d = max(-5.0, min(5.0, charm_1d)) if not (math.isnan(charm_1d) or math.isinf(charm_1d)) else 0.0
 
     # Second-Order Greek: Vanna (Identical for Call and Put)
     vanna = -disc * pdf_d1 * (d2 / sigma)
