@@ -604,3 +604,44 @@ class TestTursoBatchWriter(unittest.TestCase):
         with _patch.object(ec, "execute_pipeline", side_effect=RuntimeError("Turso pipeline failed (HTTP 500)")):
             with self.assertRaises(RuntimeError):
                 ec.execute_turso_pipeline("https://db/v2/pipeline", "tok", self._stmts(3))
+
+
+class TestStaleRefusalNotifier(unittest.TestCase):
+    """exit 3 was silent outside the Actions log; it must now notify once, safely."""
+
+    def setUp(self):
+        import eod_collector as ec
+        self.ec = ec
+
+    def test_message_names_expected_and_newest_available_date(self):
+        msg = self.ec.format_stale_alert("2026-11-20", ["2026-11-18", "2026-11-19"])
+        self.assertIn("2026-11-20", msg)
+        self.assertIn("2026-11-19", msg)
+        self.assertNotIn("2026-11-18", msg, "only the newest available date belongs in the alert")
+
+    def test_message_survives_empty_date_list(self):
+        self.assertIn("no futures/option rows", self.ec.format_stale_alert("2026-11-20", []))
+
+    def test_no_credentials_means_no_send(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(self.ec, "send_alert") as send:
+                self.assertFalse(self.ec.notify_stale_refusal("2026-11-20", ["2026-11-19"]))
+        send.assert_not_called()
+
+    def test_sends_to_configured_chat(self):
+        env = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "777"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(self.ec, "send_alert", return_value=True) as send:
+                self.assertTrue(self.ec.notify_stale_refusal("2026-11-20", ["2026-11-19"]))
+        send.assert_called_once()
+        args = send.call_args[0]
+        self.assertEqual(args[0], "123:abc")
+        self.assertEqual(args[1], "777")
+        self.assertIn("2026-11-20", args[2])
+        self.assertIn("2026-11-19", args[2])
+
+    def test_a_failing_telegram_call_never_masks_exit_3(self):
+        env = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "777"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(self.ec, "send_alert", side_effect=RuntimeError("boom")):
+                self.assertFalse(self.ec.notify_stale_refusal("2026-11-20", ["2026-11-19"]))
