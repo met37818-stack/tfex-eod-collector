@@ -193,18 +193,24 @@ def init_tfex_session() -> requests.Session:
 _thread_local = threading.local()
 
 
-def _worker_session() -> requests.Session:
+def _worker_session(cookies=None) -> requests.Session:
     """One requests.Session per worker thread.
 
     requests.Session is not thread-safe (shared connection pool and cookie jar)
-    and fetch_options_series fans out over ThreadPoolExecutor(max_workers=8).
-    Sharing the main-thread session across those workers produced intermittent
-    timeouts and interleaved connection state.
+    and fetch_options_series fans out over ThreadPoolExecutor(max_workers=8), so
+    each thread needs its own session.
+
+    `cookies` is the snapshot of the warmed-up session's jar: TFEX sits behind
+    Imperva/Incapsula and answers 403 to any series request that arrives without
+    the `visid_incap_*` / `incap_ses_*` cookies it handed out on the landing
+    page. A bare Session per thread (headers only) is therefore rejected.
     """
     session = getattr(_thread_local, "session", None)
     if session is None:
         session = requests.Session()
         session.headers.update(BASE_HEADERS)
+        if cookies is not None:
+            session.cookies.update(cookies)
         _thread_local.session = session
     return session
 
@@ -450,6 +456,11 @@ def fetch_options_series(
     parse_regex = re.compile(r"^(S50[HMUZ]\d{2})([CP])(\d+)$")
     results = []
 
+    # Snapshot the warm session's Incapsula cookies once (single-threaded) so
+    # every worker thread starts authenticated instead of getting 403.
+    warm_cookies = requests.cookies.merge_cookies(requests.cookies.RequestsCookieJar(), session.cookies)
+    print(f"[Section 4] Carrying {len(warm_cookies)} session cookie(s) into worker threads.")
+
     def fetch_single_option(sym: str) -> list[dict]:
         match = parse_regex.match(sym)
         if not match:
@@ -458,7 +469,7 @@ def fetch_options_series(
         strike_val = float(strike_str)
 
         opt_url = f"https://www.tfex.co.th/api/set/tfex/series/{sym}/historical-trading?website=tfex&lang=en"
-        r = get_with_retry(_worker_session(), opt_url, headers=headers, timeout=12)
+        r = get_with_retry(_worker_session(warm_cookies), opt_url, headers=headers, timeout=12)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}")
         data = r.json().get("data", [])

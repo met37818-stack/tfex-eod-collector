@@ -175,6 +175,27 @@ class TestWorkerSessions(unittest.TestCase):
 
         self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
 
+    def test_worker_session_inherits_warm_cookies(self):
+        # TFEX (Imperva/Incapsula) answers 403 to a series request without the
+        # session cookies handed out on the landing page, so a bare per-thread
+        # session silently loses every option contract.
+        import eod_collector as ec
+
+        warm = requests.cookies.RequestsCookieJar()
+        warm.set("incap_ses_357_3037351", "abc123", domain=".tfex.co.th", path="/")
+
+        seen = {}
+
+        def grab():
+            seen["session"] = ec._worker_session(warm)
+
+        thread = threading.Thread(target=grab)
+        thread.start()
+        thread.join()
+
+        self.assertIn("incap_ses_357_3037351", seen["session"].cookies)
+        self.assertEqual(seen["session"].cookies.get("incap_ses_357_3037351"), "abc123")
+
 
 class TestTargetTradeDate(unittest.TestCase):
     """The trade_date a run must collect, before any network call."""
@@ -276,6 +297,8 @@ class TestOptionScrapeAccounting(unittest.TestCase):
                 }]})
 
         class MainSession:
+            cookies = requests.cookies.RequestsCookieJar()
+
             def get(self, url, **kwargs):
                 class R:
                     status_code = 200
