@@ -104,6 +104,28 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
                     return active_series
     return active_series
 
+def options_collection_failure(
+    opt_records: list,
+    discovered_count: int,
+    fetch_error_count: int = 0,
+    no_data_count: int = 0,
+) -> Optional[str]:
+    """Reason a run must not be reported as successful, or None when it is fine.
+
+    The date invariant says nothing about Section 4: futures can arrive normally
+    while every option contract fails, and the run still printed SUCCESS and
+    exited 0 — which is exactly how a total options outage goes unnoticed.
+    """
+    if opt_records:
+        return None
+    if discovered_count == 0:
+        return "discovered 0 option contracts (market page layout changed?)"
+    return (
+        f"discovered {discovered_count} contracts but collected 0 rows "
+        f"(fetch errors: {fetch_error_count}, no data: {no_data_count})"
+    )
+
+
 def resolve_target_trade_date(
     ref_time: datetime.datetime = None,
 ) -> tuple[datetime.date, bool, str]:
@@ -425,16 +447,16 @@ def fetch_futures_series(session: requests.Session, active_series: list[str]) ->
 def fetch_options_series(
     session: requests.Session,
     active_series: list[str],
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[dict], int, int, int]:
     """
     Section 4: Active Options Series (eod_options_series).
     Scrapes contract symbols for active series, then concurrently fetches 5 days history
     with ThreadPoolExecutor(8 workers).
 
-    Returns (records, fetch_error_count, no_data_count). An HTTP/network failure
-    and a contract that genuinely has no rows are different problems and are
-    counted separately: the old code collapsed both into one "failed" number and
-    logged neither.
+    Returns (records, fetch_error_count, no_data_count, discovered_count).
+    An HTTP/network failure and a contract that genuinely has no rows are
+    different problems and are counted separately: the old code collapsed both
+    into one "failed" number and logged neither.
     """
     market_page_url = "https://www.tfex.co.th/en/products/equity/set50-index-options/market-data"
     print(f"[Section 4] Discovering option symbols from {market_page_url}...")
@@ -445,7 +467,8 @@ def fetch_options_series(
     series_regex_pattern = "|".join(re.escape(s) for s in active_series)
     contract_pattern = re.compile(rf"(?:{series_regex_pattern})[CP]\d+")
     symbols = sorted(list(set(contract_pattern.findall(resp.text))))
-    print(f"[Section 4] Discovered {len(symbols)} option contracts for {active_series}.")
+    discovered_count = len(symbols)
+    print(f"[Section 4] Discovered {discovered_count} option contracts for {active_series}.")
 
     headers = {
         "User-Agent": BASE_HEADERS["User-Agent"],
@@ -518,7 +541,7 @@ def fetch_options_series(
         f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts "
         f"(fetch errors: {fetch_error_count}, no data: {no_data_count})."
     )
-    return results, fetch_error_count, no_data_count
+    return results, fetch_error_count, no_data_count, discovered_count
 
 def fetch_thor_rates() -> list[dict]:
     """
@@ -1422,7 +1445,9 @@ def main():
     inv_types = fetch_investor_types(tfex_session)
     mkt_stats = fetch_market_stats(tfex_session)
     fut_series = fetch_futures_series(tfex_session, active_series)
-    opt_series, fetch_error_count, no_data_count = fetch_options_series(tfex_session, active_series)
+    opt_series, fetch_error_count, no_data_count, discovered_options = fetch_options_series(
+        tfex_session, active_series
+    )
     thor_rates = fetch_thor_rates()
 
     elapsed_collect = time.time() - start_time
@@ -1447,6 +1472,21 @@ def main():
             else:
                 print("[GUARD] Refusing to write/report stale data. Re-run with --allow-stale to override.")
                 sys.exit(3)
+
+    # 3.6 Options Collection Guard
+    # A passing date invariant is not proof that Section 4 worked: futures rows can
+    # arrive while all 78 option contracts fail, and every downstream table
+    # (eod_options_greeks, then arb-opp / quant-analytics) silently ends up empty.
+    options_failure = options_collection_failure(
+        opt_series, discovered_options, fetch_error_count, no_data_count
+    )
+    if not is_non_trading and options_failure:
+        print(f"[GUARD] OPTIONS EMPTY: {options_failure}")
+        if args.allow_stale:
+            print("[GUARD] --allow-stale passed: continuing without option/greeks data.")
+        else:
+            print("[GUARD] Refusing to report success with no option data. Re-run with --allow-stale to override.")
+            sys.exit(4)
 
     # 4. Generate Idempotent Upsert Statements
     statements = build_upsert_statements(

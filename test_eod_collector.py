@@ -312,12 +312,13 @@ class TestOptionScrapeAccounting(unittest.TestCase):
 
         with mock.patch.object(ec, "_worker_session", return_value=Worker()), \
                 mock.patch.object(ec, "get_with_retry", side_effect=lambda s, u, **k: s.get(u, **k)):
-            records, errors, no_data = ec.fetch_options_series(MainSession(), ["S50Z26"])
+            records, errors, no_data, discovered = ec.fetch_options_series(MainSession(), ["S50Z26"])
 
         self.assertEqual(errors, 1, "network error must be counted as a fetch error")
         self.assertEqual(no_data, 1, "HTTP 200 with no rows must be counted as no-data")
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["symbol"], "S50Z26C940")
+        self.assertEqual(discovered, 3, "discovery count must be reported so an empty result can be flagged")
 
 
 class TestTelegramTokenHygiene(unittest.TestCase):
@@ -414,6 +415,30 @@ class TestRetentionReporting(unittest.TestCase):
         finally:
             if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
+
+
+class TestOptionsCollectionGuard(unittest.TestCase):
+    """A run that produced option rows is fine; one that produced none is not."""
+
+    def test_ok_when_rows_present(self):
+        import eod_collector as ec
+
+        self.assertIsNone(ec.options_collection_failure([{"symbol": "S50Z26C1000"}], 78, 0, 0))
+
+    def test_all_contracts_failed(self):
+        import eod_collector as ec
+
+        reason = ec.options_collection_failure([], 78, 78, 0)
+        self.assertIsNotNone(reason)
+        self.assertIn("78", reason)
+        self.assertIn("fetch errors: 78", reason)
+
+    def test_discovery_returned_nothing(self):
+        import eod_collector as ec
+
+        reason = ec.options_collection_failure([], 0, 0, 0)
+        self.assertIsNotNone(reason)
+        self.assertIn("discovered 0", reason)
 
 
 class TestTieredRetentionPolicy(unittest.TestCase):
