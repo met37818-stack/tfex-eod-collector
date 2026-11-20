@@ -16,12 +16,13 @@ import os
 import sys
 import re
 import json
+import math
 import time
-import calendar
 import argparse
 import datetime
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import sqlite3
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -35,48 +36,10 @@ import pytz
 
 BKK_TZ = pytz.timezone("Asia/Bangkok")
 
-# Official SET Holidays (2026 - 2027)
-SET_HOLIDAYS = {
-    # 2026
-    "2026-01-01",  # New Year's Day
-    "2026-01-02",  # New Year Special Holiday
-    "2026-03-03",  # Makha Bucha Day
-    "2026-04-06",  # Chakri Memorial Day
-    "2026-04-13",  # Songkran Festival
-    "2026-04-14",  # Songkran Festival
-    "2026-04-15",  # Songkran Festival
-    "2026-05-01",  # National Labour Day
-    "2026-05-04",  # Coronation Day
-    "2026-06-01",  # Visakha Bucha Day
-    "2026-06-03",  # H.M. Queen Suthida's Birthday
-    "2026-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2026-07-29",  # Asahna Bucha Day
-    "2026-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday
-    "2026-10-13",  # King Bhumibol Adulyadej Memorial Day
-    "2026-10-23",  # Chulalongkorn Day
-    "2026-12-07",  # Substitution for King Bhumibol's Birthday
-    "2026-12-10",  # Constitution Day
-    "2026-12-31",  # New Year's Eve
-    # 2027
-    "2027-01-01",  # New Year's Day
-    "2027-02-22",  # Makha Bucha Day
-    "2027-04-06",  # Chakri Memorial Day
-    "2027-04-13",  # Songkran Festival
-    "2027-04-14",  # Songkran Festival
-    "2027-04-15",  # Songkran Festival
-    "2027-05-03",  # Substitution for National Labour Day
-    "2027-05-04",  # Coronation Day
-    "2027-05-20",  # Visakha Bucha Day
-    "2027-06-03",  # H.M. Queen Suthida's Birthday
-    "2027-07-19",  # Asahna Bucha Day
-    "2027-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2027-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday
-    "2027-10-13",  # King Bhumibol Adulyadej Memorial Day
-    "2027-10-25",  # Substitution for Chulalongkorn Day
-    "2027-12-06",  # Substitution for King Bhumibol's Birthday
-    "2027-12-10",  # Constitution Day
-    "2027-12-31",  # New Year's Eve
-}
+# Trading calendar (holidays + quarterly expiry) has a single source of truth in
+# calendar_utils.py. This file previously carried a private copy that drifted out
+# of sync with the greeks engine's copy.
+from calendar_utils import get_penultimate_business_day, is_trading_day  # noqa: E402
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -114,18 +77,6 @@ def load_dotenv(path: str = ".env"):
             except Exception as e:
                 print(f"[WARN] Could not parse .env at {p}: {e}")
 
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
-    """Calculates the penultimate business day of a contract month."""
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = []
-    for d in range(1, last_day + 1):
-        dt = datetime.date(year, month, d)
-        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
-            biz_days.append(dt)
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
-    return biz_days[-2]
-
 def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]:
     """
     Calculate the 2 active quarterly SET50 series (H: Mar, M: Jun, U: Sep, Z: Dec).
@@ -144,7 +95,7 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
 
     for yr in range(ref_time.year, ref_time.year + 3):
         for m in quarter_months:
-            penult_day = get_penultimate_business_day(yr, m, SET_HOLIDAYS)
+            penult_day = get_penultimate_business_day(yr, m)
             expiry_dt = BKK_TZ.localize(datetime.datetime(penult_day.year, penult_day.month, penult_day.day, 16, 30, 0))
             if ref_time <= expiry_dt:
                 series_code = f"S50{month_codes[m]}{str(yr)[-2:]}"
@@ -153,11 +104,42 @@ def get_active_quarterly_series(ref_time: datetime.datetime = None) -> list[str]
                     return active_series
     return active_series
 
-def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str]:
+def options_collection_failure(
+    opt_records: list,
+    discovered_count: int,
+    fetch_error_count: int = 0,
+    no_data_count: int = 0,
+) -> Optional[str]:
+    """Reason a run must not be reported as successful, or None when it is fine.
+
+    The date invariant says nothing about Section 4: futures can arrive normally
+    while every option contract fails, and the run still printed SUCCESS and
+    exited 0 — which is exactly how a total options outage goes unnoticed.
     """
-    Determine if target trade session is a weekend or SET holiday.
-    If run before 09:00 ICT, target session is T-1.
-    If run at or after 09:00 ICT, target session is T.
+    if opt_records:
+        return None
+    if discovered_count == 0:
+        return "discovered 0 option contracts (market page layout changed?)"
+    return (
+        f"discovered {discovered_count} contracts but collected 0 rows "
+        f"(fetch errors: {fetch_error_count}, no data: {no_data_count})"
+    )
+
+
+def resolve_target_trade_date(
+    ref_time: datetime.datetime = None,
+) -> tuple[datetime.date, bool, str]:
+    """
+    Resolve the trade session this run is supposed to collect.
+
+    Before 09:00 ICT the relevant session is the previous trading day (Monday
+    morning looks back three days to Friday); at or after 09:00 it is the same
+    day. README states this date invariant explicitly — the fetched rows carry
+    their real trade_date and the clock's date is never used to label them.
+
+    Returns (target_date, is_non_trading, reason). `is_non_trading` means the
+    target date is itself a weekend or SET holiday, so there is no session to
+    collect for it.
     """
     if ref_time is None:
         ref_time = datetime.datetime.now(BKK_TZ)
@@ -179,11 +161,12 @@ def is_holiday_or_weekend(ref_time: datetime.datetime = None) -> tuple[bool, str
     weekday_name = target_date.strftime("%A")
 
     if target_date.weekday() >= 5:
-        return True, f"Target trade date {target_str} is a weekend ({weekday_name})"
-    if target_str in SET_HOLIDAYS:
-        return True, f"Target trade date {target_str} is an official SET holiday"
+        return target_date, True, f"Target trade date {target_str} is a weekend ({weekday_name})"
+    if not is_trading_day(target_date):
+        return target_date, True, f"Target trade date {target_str} is an official SET holiday"
 
-    return False, f"Target trade date {target_str} is a valid trading session"
+    return target_date, False, f"Target trade date {target_str} is a valid trading session"
+
 
 def clean_int(val) -> int:
     """Safe integer parser handling commas, signs, and blanks."""
@@ -228,6 +211,79 @@ def init_tfex_session() -> requests.Session:
         print(f"[TFEX Session] Warning: Failed to pre-fetch cookies: {e}")
     return session
 
+
+_thread_local = threading.local()
+
+
+def _worker_session(cookies=None) -> requests.Session:
+    """One requests.Session per worker thread.
+
+    requests.Session is not thread-safe (shared connection pool and cookie jar)
+    and fetch_options_series fans out over ThreadPoolExecutor(max_workers=8), so
+    each thread needs its own session.
+
+    `cookies` is the snapshot of the warmed-up session's jar: TFEX sits behind
+    Imperva/Incapsula and answers 403 to any series request that arrives without
+    the `visid_incap_*` / `incap_ses_*` cookies it handed out on the landing
+    page. A bare Session per thread (headers only) is therefore rejected.
+    """
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(BASE_HEADERS)
+        if cookies is not None:
+            session.cookies.update(cookies)
+        _thread_local.session = session
+    return session
+
+
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _retry_delay(resp: requests.Response, base_delay: float, attempt: int) -> float:
+    header = resp.headers.get("Retry-After") if resp is not None else None
+    if header:
+        try:
+            return min(float(header), 30.0)
+        except (TypeError, ValueError):
+            pass
+    return min(base_delay * (2 ** attempt), 30.0)
+
+
+def get_with_retry(
+    session: requests.Session,
+    url: str,
+    *,
+    headers: Optional[dict] = None,
+    attempts: int = 3,
+    base_delay: float = 1.5,
+    timeout: int = 15,
+) -> requests.Response:
+    """GET with bounded exponential backoff.
+
+    TFEX throttles bursts (Section 4 runs 8 workers) and intermittently answers
+    5xx. Without retries a throttled request just produced silently-missing
+    contracts, indistinguishable from a strike that never traded.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout)
+            if resp.status_code in RETRY_STATUS or resp.status_code >= 500:
+                delay = _retry_delay(resp, base_delay, attempt)
+                print(f"[retry] {attempt + 1}/{attempts} HTTP {resp.status_code} -> sleep {delay:.1f}s")
+                time.sleep(delay)
+                last_error = RuntimeError(f"HTTP {resp.status_code}")
+                continue
+            return resp
+        except requests.RequestException as exc:
+            delay = min(base_delay * (2 ** attempt), 30)
+            print(f"[retry] {attempt + 1}/{attempts} {type(exc).__name__} -> sleep {delay:.1f}s")
+            time.sleep(delay)
+            last_error = exc
+    raise RuntimeError(f"GET failed after {attempts} attempts: {url}") from last_error
+
+
 def fetch_investor_types(session: requests.Session) -> list[dict]:
     """
     Section 1: Investor Types (eod_investor_types).
@@ -235,7 +291,7 @@ def fetch_investor_types(session: requests.Session) -> list[dict]:
     """
     url = "https://www.tfex.co.th/en/market-data/historical-data/trading-by-investor-types"
     print(f"[Section 1] Fetching Investor Types from {url}...")
-    resp = session.get(url, timeout=15)
+    resp = get_with_retry(session, url, timeout=15)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -316,7 +372,7 @@ def fetch_market_stats(session: requests.Session) -> list[dict]:
             f"&marketListId={market_id}&instrumentId={inst_id}&trade=all"
         )
         print(f"[Section 2] Fetching Market Stats for {market_id}/{inst_id}...")
-        resp = session.get(api_url, headers=headers, timeout=15)
+        resp = get_with_retry(session, api_url, headers=headers, timeout=15)
         if resp.status_code != 200:
             print(f"[Section 2] Warning: Failed to fetch {market_id}/{inst_id} ({resp.status_code})")
             continue
@@ -359,7 +415,7 @@ def fetch_futures_series(session: requests.Session, active_series: list[str]) ->
     for series in active_series:
         api_url = f"https://www.tfex.co.th/api/set/tfex/series/{series}/historical-trading?website=tfex&lang=en"
         print(f"[Section 3] Fetching Futures Series {series}...")
-        resp = session.get(api_url, headers=headers, timeout=15)
+        resp = get_with_retry(session, api_url, headers=headers, timeout=15)
         if resp.status_code != 200:
             print(f"[Section 3] Warning: Failed to fetch series {series} ({resp.status_code})")
             continue
@@ -388,22 +444,31 @@ def fetch_futures_series(session: requests.Session, active_series: list[str]) ->
     print(f"[Section 3] Extracted {len(results)} futures series records for {active_series}.")
     return results
 
-def fetch_options_series(session: requests.Session, active_series: list[str]) -> list[dict]:
+def fetch_options_series(
+    session: requests.Session,
+    active_series: list[str],
+) -> tuple[list[dict], int, int, int]:
     """
     Section 4: Active Options Series (eod_options_series).
     Scrapes contract symbols for active series, then concurrently fetches 5 days history
     with ThreadPoolExecutor(8 workers).
+
+    Returns (records, fetch_error_count, no_data_count, discovered_count).
+    An HTTP/network failure and a contract that genuinely has no rows are
+    different problems and are counted separately: the old code collapsed both
+    into one "failed" number and logged neither.
     """
     market_page_url = "https://www.tfex.co.th/en/products/equity/set50-index-options/market-data"
     print(f"[Section 4] Discovering option symbols from {market_page_url}...")
-    resp = session.get(market_page_url, timeout=15)
+    resp = get_with_retry(session, market_page_url, timeout=15)
     resp.raise_for_status()
 
     # Regex pattern matching active series options, e.g. (?:S50Z26|S50H27)[CP]\d+
     series_regex_pattern = "|".join(re.escape(s) for s in active_series)
     contract_pattern = re.compile(rf"(?:{series_regex_pattern})[CP]\d+")
     symbols = sorted(list(set(contract_pattern.findall(resp.text))))
-    print(f"[Section 4] Discovered {len(symbols)} option contracts for {active_series}.")
+    discovered_count = len(symbols)
+    print(f"[Section 4] Discovered {discovered_count} option contracts for {active_series}.")
 
     headers = {
         "User-Agent": BASE_HEADERS["User-Agent"],
@@ -414,6 +479,11 @@ def fetch_options_series(session: requests.Session, active_series: list[str]) ->
     parse_regex = re.compile(r"^(S50[HMUZ]\d{2})([CP])(\d+)$")
     results = []
 
+    # Snapshot the warm session's Incapsula cookies once (single-threaded) so
+    # every worker thread starts authenticated instead of getting 403.
+    warm_cookies = requests.cookies.merge_cookies(requests.cookies.RequestsCookieJar(), session.cookies)
+    print(f"[Section 4] Carrying {len(warm_cookies)} session cookie(s) into worker threads.")
+
     def fetch_single_option(sym: str) -> list[dict]:
         match = parse_regex.match(sym)
         if not match:
@@ -422,49 +492,56 @@ def fetch_options_series(session: requests.Session, active_series: list[str]) ->
         strike_val = float(strike_str)
 
         opt_url = f"https://www.tfex.co.th/api/set/tfex/series/{sym}/historical-trading?website=tfex&lang=en"
-        try:
-            r = session.get(opt_url, headers=headers, timeout=12)
-            if r.status_code != 200:
-                return []
-            data = r.json().get("data", [])
-            opt_records = []
-            for item in data[:5]:
-                raw_date = item.get("date")
-                if not raw_date:
-                    continue
-                opt_records.append({
-                    "trade_date": raw_date[:10],
-                    "symbol": sym,
-                    "series": ser,
-                    "option_type": opt_type,
-                    "strike": strike_val,
-                    "open": clean_float(item.get("open")),
-                    "high": clean_float(item.get("high")),
-                    "low": clean_float(item.get("low")),
-                    "close": clean_float(item.get("close")),
-                    "settlement_price": clean_float(item.get("settlementPrice")),
-                    "chg": clean_float(item.get("change")),
-                    "pct_chg": clean_float(item.get("percentChange")),
-                    "volume": clean_int(item.get("totalVolume")),
-                    "oi": clean_int(item.get("oi")),
-                })
-            return opt_records
-        except Exception as e:
-            return []
+        r = get_with_retry(_worker_session(warm_cookies), opt_url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json().get("data", [])
+        opt_records = []
+        for item in data[:5]:
+            raw_date = item.get("date")
+            if not raw_date:
+                continue
+            opt_records.append({
+                "trade_date": raw_date[:10],
+                "symbol": sym,
+                "series": ser,
+                "option_type": opt_type,
+                "strike": strike_val,
+                "open": clean_float(item.get("open")),
+                "high": clean_float(item.get("high")),
+                "low": clean_float(item.get("low")),
+                "close": clean_float(item.get("close")),
+                "settlement_price": clean_float(item.get("settlementPrice")),
+                "chg": clean_float(item.get("change")),
+                "pct_chg": clean_float(item.get("percentChange")),
+                "volume": clean_int(item.get("totalVolume")),
+                "oi": clean_int(item.get("oi")),
+            })
+        return opt_records
 
     print(f"[Section 4] Fetching historical trading for {len(symbols)} options with 8 workers...")
-    scrape_failed_count = 0
+    fetch_error_count = 0
+    no_data_count = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_sym = {executor.submit(fetch_single_option, sym): sym for sym in symbols}
         for future in as_completed(future_to_sym):
-            recs = future.result()
+            sym = future_to_sym[future]
+            try:
+                recs = future.result()
+            except Exception as exc:
+                fetch_error_count += 1
+                print(f"[Section 4] FAILED {sym}: {type(exc).__name__}: {exc}")
+                continue
             if recs:
                 results.extend(recs)
             else:
-                scrape_failed_count += 1
+                no_data_count += 1
 
-    print(f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts (Failed: {scrape_failed_count}).")
-    return results, scrape_failed_count
+    print(
+        f"[Section 4] Extracted {len(results)} option series records across {len(symbols)} contracts "
+        f"(fetch errors: {fetch_error_count}, no data: {no_data_count})."
+    )
+    return results, fetch_error_count, no_data_count, discovered_count
 
 def fetch_thor_rates() -> list[dict]:
     """
@@ -476,7 +553,7 @@ def fetch_thor_rates() -> list[dict]:
     print(f"[Section 5] Fetching THOR rates from {url}...")
     headers = {"User-Agent": BASE_HEADERS["User-Agent"]}
     session = requests.Session()
-    r = session.get(url, headers=headers, timeout=15)
+    r = get_with_retry(session, url, headers=headers, timeout=15)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -670,7 +747,11 @@ DDL_STATEMENTS = [
 ]
 
 def to_turso_arg(val) -> dict:
-    """Format Python values into libSQL / Turso typed arguments."""
+    """Format Python values into libSQL / Turso typed arguments.
+
+    NaN/Inf are mapped to NULL: they are not valid JSON, so serialising one
+    would make the whole pipeline request fail.
+    """
     if val is None:
         return {"type": "null"}
     elif isinstance(val, bool):
@@ -678,6 +759,8 @@ def to_turso_arg(val) -> dict:
     elif isinstance(val, int):
         return {"type": "integer", "value": str(val)}
     elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return {"type": "null"}
         return {"type": "float", "value": val}
     else:
         return {"type": "text", "value": str(val)}
@@ -742,13 +825,13 @@ def execute_sqlite_local(db_path: str, statements: list[dict]):
     """Execute statements against local SQLite database (for testing and fallback)."""
     print(f"[Local SQLite] Executing {len(statements)} statements on {db_path}...")
     conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    for stmt in statements:
-        sql = stmt["sql"].strip()
-        args = stmt.get("args", [])
-        cursor.execute(sql, args)
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        for stmt in statements:
+            cursor.execute(stmt["sql"].strip(), stmt.get("args", []))
+        conn.commit()
+    finally:
+        conn.close()
     print(f"[Local SQLite] Successfully committed {len(statements)} statements to {db_path}.")
 
 def build_upsert_statements(
@@ -870,6 +953,29 @@ INTRADAY_TABLES = [
     "options_snapshots"
 ]
 
+def _pipeline_affected_rows(result: dict) -> Optional[int]:
+    """Rows a libSQL HTTP-pipeline execute result actually modified.
+
+    Returns None when the statement failed or the endpoint did not report a
+    count — callers must treat None as "unknown/failed", never as zero.
+    """
+    if not isinstance(result, dict) or result.get("type") != "ok":
+        return None
+    payload = (result.get("response") or {}).get("result") or {}
+    affected = payload.get("affected_row_count")
+    if affected is None:
+        return None
+    try:
+        return int(affected)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_deleted(value: Optional[int]) -> str:
+    """Human/Telegram-safe rendering: an unknown count is a failure, not 0."""
+    return "⚠️ ล้มเหลว" if value is None else f"{value:,} แถวถูกลบ"
+
+
 def run_tiered_retention_guard(
     pipeline_url: str = None,
     auth_token: str = None,
@@ -881,7 +987,10 @@ def run_tiered_retention_guard(
     1. options_snapshots (Tier 1): Retain 14 days; delete rows where captured_at_bkk < date('now', '-14 days').
     2. futures_snapshots & spot_snapshots (Tier 2): Retain 90 days; delete rows where captured_at_bkk < date('now', '-90 days').
     3. All eod_* tables & daily_realized_vol (Tier 3): STRICTLY PERMANENT; never deleted.
-    Returns dictionary with deleted rows count per table and cutoff timestamps.
+
+    Deleted counts come from the DELETE itself (affected_row_count / rowcount).
+    A count that cannot be confirmed is reported as None — the previous version
+    pre-counted the rows, so a failed DELETE still printed "N rows deleted".
     """
     now_bkk = datetime.datetime.now(BKK_TZ)
     base_date = ref_date or now_bkk.date()
@@ -892,10 +1001,10 @@ def run_tiered_retention_guard(
     cutoff_options_str = cutoff_options_date.strftime("%Y-%m-%d 00:00:00")
     cutoff_futures_spot_str = cutoff_futures_spot_date.strftime("%Y-%m-%d 00:00:00")
 
-    deleted_counts = {
-        "options_snapshots": 0,
-        "futures_snapshots": 0,
-        "spot_snapshots": 0,
+    deleted_counts: Dict[str, Any] = {
+        "options_snapshots": None,
+        "futures_snapshots": None,
+        "spot_snapshots": None,
         "cutoff_options": cutoff_options_str,
         "cutoff_futures_spot": cutoff_futures_spot_str
     }
@@ -915,32 +1024,6 @@ def run_tiered_retention_guard(
             "Authorization": f"Bearer {auth_token}",
             "Content-Type": "application/json"
         }
-        cnt_reqs = [
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
-            {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
-            {"type": "close"}
-        ]
-        try:
-            r_cnt = requests.post(pipeline_url, headers=headers, json={"requests": cnt_reqs}, timeout=20)
-            if r_cnt.status_code == 200:
-                res = r_cnt.json()
-                results = res.get("results", [])
-                if len(results) >= 1 and results[0].get("type") == "ok":
-                    rows = results[0]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["options_snapshots"] = int(rows[0][0]["value"])
-                if len(results) >= 2 and results[1].get("type") == "ok":
-                    rows = results[1]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["futures_snapshots"] = int(rows[0][0]["value"])
-                if len(results) >= 3 and results[2].get("type") == "ok":
-                    rows = results[2]["response"]["result"]["rows"]
-                    if rows and rows[0][0]["type"] != "null":
-                        deleted_counts["spot_snapshots"] = int(rows[0][0]["value"])
-        except Exception as e:
-            print(f"[RETENTION] Warning: Failed to pre-count rows in Turso: {e}")
-
         del_reqs = [
             {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_options_str}]}},
             {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", "args": [{"type": "text", "value": cutoff_futures_spot_str}]}},
@@ -951,19 +1034,26 @@ def run_tiered_retention_guard(
         ]
         try:
             r_del = requests.post(pipeline_url, headers=headers, json={"requests": del_reqs}, timeout=30)
-            if r_del.status_code == 200:
-                res_del = r_del.json()
-                results = res_del.get("results", [])
+            if r_del.status_code != 200:
+                print(f"[RETENTION] ERROR: Turso retention pipeline failed (HTTP {r_del.status_code})")
+            else:
+                results = r_del.json().get("results", [])
+                for idx, key in enumerate(("options_snapshots", "futures_snapshots", "spot_snapshots")):
+                    if idx >= len(results):
+                        print(f"[RETENTION] ERROR: no result for {key} DELETE")
+                        continue
+                    affected = _pipeline_affected_rows(results[idx])
+                    if affected is None:
+                        print(f"[RETENTION] ERROR: {key} DELETE did not report an affected row count")
+                    deleted_counts[key] = affected
                 if len(results) >= 5:
-                    pc_res = results[3]
-                    ps_res = results[4]
+                    pc_res, ps_res = results[3], results[4]
                     if pc_res.get("type") == "ok" and ps_res.get("type") == "ok":
                         pc = int(pc_res["response"]["result"]["rows"][0][0]["value"])
                         ps = int(ps_res["response"]["result"]["rows"][0][0]["value"])
-                        new_mb = (pc * ps) / (1024 * 1024)
-                        print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
+                        print(f"[RETENTION] Post-cleanup DB Size: {(pc * ps) / (1024 * 1024):.2f} MB")
         except Exception as e:
-            print(f"[RETENTION] Error executing Turso tiered retention delete: {e}")
+            print(f"[RETENTION] Error executing Turso tiered retention delete: {type(e).__name__}: {e}")
     else:
         target_db = db_file or "eod_tfex.db"
         if os.path.exists(target_db):
@@ -973,20 +1063,16 @@ def run_tiered_retention_guard(
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 existing_tables = set(row[0] for row in cur.fetchall())
 
-                if "options_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
-                    deleted_counts["options_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM options_snapshots WHERE captured_at_bkk < ?;", (cutoff_options_str,))
-
-                if "futures_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-                    deleted_counts["futures_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM futures_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-
-                if "spot_snapshots" in existing_tables:
-                    cur.execute("SELECT COUNT(*) FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
-                    deleted_counts["spot_snapshots"] = cur.fetchone()[0]
-                    cur.execute("DELETE FROM spot_snapshots WHERE captured_at_bkk < ?;", (cutoff_futures_spot_str,))
+                for key, table, cutoff in (
+                    ("options_snapshots", "options_snapshots", cutoff_options_str),
+                    ("futures_snapshots", "futures_snapshots", cutoff_futures_spot_str),
+                    ("spot_snapshots", "spot_snapshots", cutoff_futures_spot_str),
+                ):
+                    if table not in existing_tables:
+                        deleted_counts[key] = 0
+                        continue
+                    cur.execute(f"DELETE FROM {table} WHERE captured_at_bkk < ?;", (cutoff,))
+                    deleted_counts[key] = cur.rowcount
 
                 conn.commit()
                 try:
@@ -998,15 +1084,16 @@ def run_tiered_retention_guard(
                 cur.execute("PRAGMA page_size;")
                 ps = cur.fetchone()[0]
                 conn.close()
-                new_mb = (pc * ps) / (1024 * 1024)
-                print(f"[RETENTION] Post-cleanup DB Size: {new_mb:.2f} MB")
+                print(f"[RETENTION] Post-cleanup DB Size: {(pc * ps) / (1024 * 1024):.2f} MB")
             except Exception as e:
-                print(f"[RETENTION] Error executing local SQLite tiered retention delete: {e}")
+                print(f"[RETENTION] Error executing local SQLite tiered retention delete: {type(e).__name__}: {e}")
+        else:
+            print(f"[RETENTION] Local database {target_db} not found; nothing to purge.")
 
     print(f"[RETENTION] Summary of purged records:")
-    print(f"  • options_snapshots (14d limit): {deleted_counts['options_snapshots']:,} rows deleted")
-    print(f"  • futures_snapshots (90d limit): {deleted_counts['futures_snapshots']:,} rows deleted")
-    print(f"  • spot_snapshots    (90d limit): {deleted_counts['spot_snapshots']:,} rows deleted")
+    print(f"  • options_snapshots (14d limit): {_format_deleted(deleted_counts['options_snapshots'])}")
+    print(f"  • futures_snapshots (90d limit): {_format_deleted(deleted_counts['futures_snapshots'])}")
+    print(f"  • spot_snapshots    (90d limit): {_format_deleted(deleted_counts['spot_snapshots'])}")
     print(f"  • eod_* & daily_realized_vol:    0 rows deleted (Strict Permanent Protection)")
     return deleted_counts
 
@@ -1025,7 +1112,8 @@ def send_eod_telegram_alert(
     auth_token: str = None,
     db_file: str = None,
     force_notify: bool = False,
-    scrape_failed_count: int = 0,
+    fetch_error_count: int = 0,
+    no_data_count: int = 0,
     retention_stats: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
@@ -1199,18 +1287,23 @@ def send_eod_telegram_alert(
 
     ret_text = ""
     if retention_stats:
-        opt_del = retention_stats.get("options_snapshots", 0)
-        fut_del = retention_stats.get("futures_snapshots", 0)
-        spt_del = retention_stats.get("spot_snapshots", 0)
+        opt_del = retention_stats.get("options_snapshots")
+        fut_del = retention_stats.get("futures_snapshots")
+        spt_del = retention_stats.get("spot_snapshots")
         ret_text = (
             f"\n\n<b>🧹 Tiered Retention Maintenance:</b>\n"
-            f"• <b>options_snapshots (14d)</b>: <code>{opt_del:,}</code> แถวถูกลบ\n"
-            f"• <b>futures_snapshots (90d)</b>: <code>{fut_del:,}</code> แถวถูกลบ\n"
-            f"• <b>spot_snapshots (90d)</b>: <code>{spt_del:,}</code> แถวถูกลบ\n"
+            f"• <b>options_snapshots (14d)</b>: {_format_deleted(opt_del)}\n"
+            f"• <b>futures_snapshots (90d)</b>: {_format_deleted(fut_del)}\n"
+            f"• <b>spot_snapshots (90d)</b>: {_format_deleted(spt_del)}\n"
             f"• <b>eod_* & daily_realized_vol</b>: <code>ถาวร (ห้ามลบ)</code>"
         )
 
-    opt_fail_text = f" ⚠️ <i>(ดึงไม่สำเร็จ {scrape_failed_count} สัญญา)</i>" if scrape_failed_count > 0 else ""
+    fail_bits = []
+    if fetch_error_count > 0:
+        fail_bits.append(f"error {fetch_error_count}")
+    if no_data_count > 0:
+        fail_bits.append(f"ไม่มีข้อมูล {no_data_count}")
+    opt_fail_text = f" ⚠️ <i>({' / '.join(fail_bits)} สัญญา)</i>" if fail_bits else ""
     message = (
         f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1243,11 +1336,16 @@ def send_eod_telegram_alert(
     try:
         resp = requests.post(tg_url, json=payload, timeout=15)
         if resp.status_code != 200:
-            print(f"[TELEGRAM] Warning: Telegram API failed ({resp.status_code}): {resp.text}")
+            # The response body is a Telegram error envelope (no token); the URL
+            # is never logged because it embeds the bot token.
+            body = (resp.text or "")[:200]
+            print(f"[TELEGRAM] Warning: Telegram API rejected the message ({resp.status_code}): {body}")
             return False
         print(f"[TELEGRAM] Notification dispatched successfully to chat_id {chat_id} for trade date {latest_date}.")
-    except Exception as e:
-        print(f"[TELEGRAM] Error sending Telegram message: {e}")
+    except requests.RequestException as exc:
+        # requests puts the full URL — including /bot<token>/ — into its exception
+        # messages, so only the exception type is logged.
+        print(f"[TELEGRAM] Error sending message: {type(exc).__name__}")
         return False
 
     # 6. Record Notification in eod_telegram_log
@@ -1301,6 +1399,11 @@ def main():
         help="Force send Telegram completion alert regardless of time window or prior notification"
     )
     parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Continue when TFEX has not published the expected trade_date yet (skips the date invariant guard)"
+    )
+    parser.add_argument(
         "--local-db",
         type=str,
         default=None,
@@ -1320,8 +1423,8 @@ def main():
     print("=" * 70)
 
     # 1. Holiday & Weekend Guard
-    is_holiday, reason = is_holiday_or_weekend(now_bkk)
-    if is_holiday:
+    target_date, is_non_trading, reason = resolve_target_trade_date(now_bkk)
+    if is_non_trading:
         print(f"[GUARD] {reason}.")
         if not (args.force or args.notify):
             print("[GUARD] Skipping execution. (Use --force or --notify to run anyway).")
@@ -1329,7 +1432,7 @@ def main():
         else:
             print("[GUARD] Override flag detected (--force / --notify). Proceeding with execution.")
     else:
-        print(f"[GUARD] Check passed: {reason}.")
+        print(f"[GUARD] Check passed: {reason}. Expected trade_date={target_date.isoformat()}.")
 
     # 2. Determine Active Quarterly Series
     active_series = get_active_quarterly_series(now_bkk)
@@ -1342,11 +1445,48 @@ def main():
     inv_types = fetch_investor_types(tfex_session)
     mkt_stats = fetch_market_stats(tfex_session)
     fut_series = fetch_futures_series(tfex_session, active_series)
-    opt_series, scrape_failed_count = fetch_options_series(tfex_session, active_series)
+    opt_series, fetch_error_count, no_data_count, discovered_options = fetch_options_series(
+        tfex_session, active_series
+    )
     thor_rates = fetch_thor_rates()
 
     elapsed_collect = time.time() - start_time
     print(f"[COLLECT] Data extraction completed in {elapsed_collect:.2f} seconds.")
+
+    # 3.5 Date Invariant Guard
+    # Rows carry the trade_date the exchange published, never the clock's date.
+    # Without this check a run against a not-yet-updated TFEX page re-upserted
+    # yesterday's rows and then announced "EOD complete" on Telegram for that
+    # stale date. Exit 3 so the external cron trigger can see the failure.
+    if not is_non_trading:
+        collected_dates = sorted({
+            r["trade_date"] for r in (fut_series + opt_series) if r.get("trade_date")
+        })
+        if target_date.isoformat() not in collected_dates:
+            print(
+                f"[GUARD] STALE: expected trade_date {target_date.isoformat()} but TFEX returned "
+                f"{collected_dates or 'no futures/options rows'}."
+            )
+            if args.allow_stale:
+                print("[GUARD] --allow-stale passed: continuing anyway (no success notification guarantee).")
+            else:
+                print("[GUARD] Refusing to write/report stale data. Re-run with --allow-stale to override.")
+                sys.exit(3)
+
+    # 3.6 Options Collection Guard
+    # A passing date invariant is not proof that Section 4 worked: futures rows can
+    # arrive while all 78 option contracts fail, and every downstream table
+    # (eod_options_greeks, then arb-opp / quant-analytics) silently ends up empty.
+    options_failure = options_collection_failure(
+        opt_series, discovered_options, fetch_error_count, no_data_count
+    )
+    if not is_non_trading and options_failure:
+        print(f"[GUARD] OPTIONS EMPTY: {options_failure}")
+        if args.allow_stale:
+            print("[GUARD] --allow-stale passed: continuing without option/greeks data.")
+        else:
+            print("[GUARD] Refusing to report success with no option data. Re-run with --allow-stale to override.")
+            sys.exit(4)
 
     # 4. Generate Idempotent Upsert Statements
     statements = build_upsert_statements(
@@ -1409,7 +1549,8 @@ def main():
                 pipeline_url=pipeline_url,
                 auth_token=turso_token,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count,
+                fetch_error_count=fetch_error_count,
+                no_data_count=no_data_count,
                 retention_stats=retention_stats
             )
         else:
@@ -1419,7 +1560,8 @@ def main():
                 chat_id=chat_id,
                 db_file=db_file,
                 force_notify=args.notify,
-                scrape_failed_count=scrape_failed_count,
+                fetch_error_count=fetch_error_count,
+                no_data_count=no_data_count,
                 retention_stats=retention_stats
             )
     else:

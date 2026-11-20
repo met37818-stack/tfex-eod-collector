@@ -34,17 +34,25 @@ Stateless Python EOD Data Collector สำหรับดึงข้อมู�
 
 ---
 
-## 3. รอบการทำงานอัตโนมัติ (GitHub Actions Schedule)
+## 3. รอบการทำงานอัตโนมัติ (External Scheduler → GitHub Actions)
 
-Workflow ถูกตั้งค่าไว้ใน [`.github/workflows/collect_eod.yml`](.github/workflows/collect_eod.yml) รันวันจันทร์–ศุกร์ตามเวลาประเทศไทย:
+> **สำคัญ:** workflow นี้ **ไม่มี native `schedule:` แล้ว** — ถูกถอดออกใน commit `c43fea5` และย้ายไปใช้ **cron-job.org** เป็นตัวトリガーภายนอก (กด `workflow_dispatch` ผ่าน API) ถ้าจะแก้เวลา/เพิ่มรอบ ต้องแก้ที่ cron-job.org ด้วย ไม่ใช่แค่ในไฟล์ workflow
 
-- `0 14 * * 1-5` : **21:00 น. วัน T** (สรุปข้อมูลรอบหัวค่ำหลังตลาดปิด)
-- `0 18 * * 1-5` : **01:00 น. วัน T+1** (อัปเดตข้อมูลรอบดึกหลัง SET/TFEX ปรับปรุงระบบ EOD)
-- `15 23 * * 0-4` : **06:15 น. วันจันทร์–ศุกร์** (ตรวจสอบความครบถ้วนรอบสุดท้ายและส่งแจ้งเตือน Telegram ก่อนตลาดเปิด)
+รอบการทำงานที่ cron-job.org เรียกเข้ามา (วันจันทร์–ศุกร์ตามเวลาไทย):
+
+| เวลา (ICT) | UTC cron ที่ตั้งไว้ | วัตถุประสงค์ |
+|---|---|---|
+| **21:00 น. วัน T** | `0 14 * * 1-5` | สรุปข้อมูลรอบหัวค่ำหลังตลาดปิด (`trade_date` = วันเดียวกัน) |
+| **01:00 น. วัน T+1** | `0 18 * * 1-5` | อัปเดตข้อมูลรอบดึกหลัง SET/TFEX ปรับปรุงระบบ EOD (`trade_date` = T) |
+| **06:15 น. วันจันทร์–ศุกร์** | `15 23 * * 0-4` | ตรวจความครบถ้วนรอบสุดท้าย + ส่งแจ้งเตือน Telegram ก่อนตลาดเปิด (window ที่ยอมให้ส่งคือ 05:30–07:30 ICT ตาม `send_eod_telegram_alert`) |
+
+**Exit codes:** `0` = ปกติ/ข้ามเพราะวันหยุด, `3` = **STALE** (TFEX ยังไม่เผยแพร่ EOD ของวันเป้าหมาย — ระบบจะไม่เขียนข้อมูลเก่าทับและไม่ส่ง Telegram ว่า "เสร็จแล้ว"), `4` = **OPTIONS EMPTY** (พบสัญญา options แต่ดึงข้อมูลได้ 0 แถว หรือ discovery ได้ 0 สัญญา — ปลายทาง `eod_options_greeks` จะว่างทั้งตาราง) ให้ cron-job.org แจ้งเตือนเมื่อเจอ `3` หรือ `4`
+
+> **วัดจริงเมื่อ 2026-11-20 เวลา ~21:00 ICT:** TFEX ยังไม่เผยแพร่ settlement ของวันนั้น (futures/options คืนข้อมูลถึง T-1 เท่านั้น ขณะที่หน้า investor types มีของวันนั้นแล้ว) รอบ 21:00 จึงจะได้ exit `3` ถ้าไม่ส่ง `allow_stale: true` — แนะนำให้ cron-job.org รอบ 21:00 ส่ง input `allow_stale=true` (เป็นรอบ warm-up) ส่วนรอบ 01:00 และ 06:15 ปล่อยว่างไว้ เพื่อให้ความครบถ้วนถูกบังคับจริงในรอบสุดท้าย
 
 ### การสั่งรันแบบ Manual (Workflow Dispatch):
 สามารถกด **Run workflow** ได้จากแท็บ Actions บน GitHub โดยมีตัวเลือก:
-- `force_run` (boolean): บังคับรันทันทีโดยไม่สนใจวันหยุดเสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ของตลาดหลักทรัพย์ฯ (`SET_HOLIDAYS`)
+- `force_run` (boolean): บังคับรันทันทีโดยไม่สนใจวันหยุดเสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ของตลาดหลักทรัพย์ฯ (`calendar_utils.SET_HOLIDAYS`)
 
 ---
 
@@ -53,6 +61,8 @@ Workflow ถูกตั้งค่าไว้ใน [`.github/workflows/colle
 ### 4.1 ติดตั้ง Dependencies
 ```bash
 python -m pip install -r requirements.txt
+# สำหรับ backfill_from_excel.py (ต้องใช้ openpyxl ซึ่งไม่ต้องใช้ตอนรัน collector)
+python -m pip install -r requirements-dev.txt
 ```
 
 ### 4.2 ทดสอบด้วย Local SQLite (ไม่ต้องมี Turso Token)
@@ -60,9 +70,17 @@ python -m pip install -r requirements.txt
 ```bash
 # ทดสอบรันและบันทึกลง local SQLite (eod_tfex.db)
 python eod_collector.py --force --local-db eod_tfex.db
+
+# ข้าม date invariant guard (ใช้เมื่อรันย้อนหลัง/ทดสอบตอน TFEX ยังไม่อัปเดต)
+python eod_collector.py --force --allow-stale --local-db eod_tfex.db
 ```
 
-### 4.3 ทดสอบด้วย Turso Cloud จริง และส่งแจ้งเตือน Telegram
+### 4.3 รัน Unit Tests
+```bash
+python -m unittest -v test_eod_collector
+```
+
+### 4.4 ทดสอบด้วย Turso Cloud จริง และส่งแจ้งเตือน Telegram
 1. คัดลอกไฟล์ `.env.example` เป็น `.env`:
    ```bash
    cp .env.example .env

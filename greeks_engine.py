@@ -15,11 +15,12 @@ Strict Fail-Loud / No Silent Defaults:
 import os
 import sys
 import math
-import calendar
 import argparse
 import datetime
 from datetime import date, time
 from typing import Dict, List, Tuple, Any, Optional
+
+from calendar_utils import get_penultimate_business_day, get_series_expiry_date
 
 # Thailand Timezone
 try:
@@ -28,13 +29,9 @@ try:
 except ImportError:
     BKK_TZ = datetime.timezone(datetime.timedelta(hours=7))
 
-# Standard TFEX SET Holidays for Expiry Calculation
-SET_HOLIDAYS = {
-    "2026-01-01", "2026-02-12", "2026-04-06", "2026-04-13", "2026-04-14", "2026-04-15",
-    "2026-05-01", "2026-05-04", "2026-05-18", "2026-06-03", "2026-07-28", "2026-07-29",
-    "2026-08-12", "2026-10-13", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
-    "2027-01-01"
-}
+# SET_HOLIDAYS lives in calendar_utils.py — see the module docstring there for
+# why a single shared copy matters (this file used to carry an incomplete list,
+# which gave S50Z27 a different expiry than the collector computed).
 
 # ==============================================================================
 # 1. MATHEMATICAL FORMULAS (PURE PYTHON STANDARD LIBRARY)
@@ -148,7 +145,9 @@ def calculate_black76_full_greeks(
         charm_raw = -r * disc * norm_cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))
         charm_1d = charm_raw / 365.0
 
-    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry 1/T asymptotic explosion
+    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry 1/T asymptotic
+    # explosion. The clamp is deliberate: rows with dte<=2 carry charm clipped to
+    # +/-5 rather than the unbounded analytic value.
     if T <= (2.0 / 365.0) or math.isnan(charm_1d) or math.isinf(charm_1d):
         charm_1d = max(-5.0, min(5.0, charm_1d)) if not (math.isnan(charm_1d) or math.isinf(charm_1d)) else 0.0
 
@@ -167,36 +166,8 @@ def calculate_black76_full_greeks(
 # ==============================================================================
 # 2. CALENDAR & EXPIRY UTILITIES
 # ==============================================================================
-
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
-    """Calculates the penultimate business day of a contract month."""
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = []
-    for d in range(1, last_day + 1):
-        dt = datetime.date(year, month, d)
-        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
-            biz_days.append(dt)
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
-    return biz_days[-2]
-
-def get_series_expiry_date(series_code: str, ref_date: datetime.date) -> datetime.date:
-    """
-    Extracts expiration date for quarterly series (e.g. S50Z26 or Z26 -> Dec 2026).
-    Quarter codes: H = March, M = June, U = September, Z = December.
-    """
-    code_map = {"H": 3, "M": 6, "U": 9, "Z": 12}
-    code = series_code.upper()
-    if code.startswith("S50"):
-        quarter_char = code[3]
-        year_suffix = int(code[4:6])
-    else:
-        quarter_char = code[0]
-        year_suffix = int(code[1:3])
-
-    quarter_month = code_map.get(quarter_char, 12)
-    full_year = 2000 + year_suffix
-    return get_penultimate_business_day(full_year, quarter_month)
+# SET_HOLIDAYS, get_penultimate_business_day() and get_series_expiry_date() are
+# imported from calendar_utils.py (one shared copy with eod_collector.py).
 
 # ==============================================================================
 # 3. SCHEMA DDL FOR TURSO / SQLITE
@@ -229,6 +200,13 @@ CREATE TABLE IF NOT EXISTS eod_options_greeks (
 # 4. GREEKS PROCESSING ENGINE
 # ==============================================================================
 
+# BOT publishes THOR in percent (1.25 == 1.25% p.a.). Never infer the unit from
+# the magnitude of the number: a genuine sub-0.5% rate (or a 6M average in a
+# steep cutting cycle) used to be read as a decimal and inflated x100, silently
+# corrupting IV and every downstream greek.
+THOR_MAX_PCT = 20.0
+
+
 def select_dynamic_thor_rate(
     thor_record: Dict[str, Optional[float]],
     dte: int
@@ -250,15 +228,20 @@ def select_dynamic_thor_rate(
         Prefer 6M Compounded ('6m')
         Fallback: 3M Compounded -> Overnight
     """
-    def _clean(val: Optional[float]) -> Optional[float]:
-        if val is None or val <= 0:
+    def _to_decimal_rate(pct: Optional[float], tenor: str) -> Optional[float]:
+        """BOT publishes THOR in percent (1.25 == 1.25% p.a.). Always divide by 100."""
+        if pct is None or pct <= 0:
             return None
-        return val / 100.0 if val > 0.5 else val
+        if pct > THOR_MAX_PCT:
+            raise ValueError(
+                f"THOR {tenor} out of range: {pct} (expected percent, <= {THOR_MAX_PCT})"
+            )
+        return pct / 100.0
 
-    r_on = _clean(thor_record.get("overnight"))
-    r_1m = _clean(thor_record.get("1m"))
-    r_3m = _clean(thor_record.get("3m"))
-    r_6m = _clean(thor_record.get("6m"))
+    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
+    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
+    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
+    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
 
     if dte <= 30:
         candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
@@ -316,8 +299,11 @@ def compute_greeks_records_for_date(
             continue
 
         # Expiry & DTE
-        expiry_date = get_series_expiry_date(series, trade_date_obj)
+        expiry_date = get_series_expiry_date(series)
         dte = max(0, (expiry_date - trade_date_obj).days)
+        # Floor T at half a day so an expiry-day row (dte=0) does not divide by
+        # zero. Consequence: greeks for dte=0 describe a 12-hour option, not an
+        # expiring one — treat those rows as indicative only.
         T_years = max(dte, 0.5) / 365.0
 
         # Dynamic contract-specific THOR rate
@@ -358,7 +344,8 @@ def compute_greeks_records_for_date(
                     "updated_at_bkk": now_bkk_str
                 })
                 valid_count += 1
-            except Exception:
+            except Exception as exc:
+                print(f"[GREEKS] {symbol}: greeks calculation failed ({type(exc).__name__}: {exc})")
                 greeks_records.append({
                     "trade_date": trade_date, "symbol": symbol, "series": series,
                     "option_type": opt_type, "strike": strike, "underlying_futures": underlying,
