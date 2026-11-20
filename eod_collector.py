@@ -37,9 +37,13 @@ import pytz
 BKK_TZ = pytz.timezone("Asia/Bangkok")
 
 # Trading calendar (holidays + quarterly expiry) has a single source of truth in
-# calendar_utils.py. This file previously carried a private copy that drifted out
+# tfex_common.calendar. This file previously carried a private copy that drifted out
 # of sync with the greeks engine's copy.
-from calendar_utils import get_penultimate_business_day, is_trading_day  # noqa: E402
+from tfex_common.calendar import (  # noqa: E402
+    SET_HOLIDAYS,
+    get_penultimate_business_day,
+    is_trading_day,
+)
 
 BASE_HEADERS = {
     "User-Agent": (

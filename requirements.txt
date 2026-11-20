@@ -6,3 +6,7 @@ requests==2.34.2
 beautifulsoup4==4.15.0
 soupsieve==4.1.3
 pytz==2026.6
+# Shared calendar / THOR / Turso / Telegram helpers (extracted 2026-11).
+# Pinned to a tag on purpose: never track main, or a shared fix reaches
+# production without review.
+tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@v0.2.0
