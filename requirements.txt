@@ -9,4 +9,4 @@ pytz==2026.6
 # Shared calendar / THOR / Turso / Telegram helpers (extracted 2026-11).
 # Pinned to a tag on purpose: never track main, or a shared fix reaches
 # production without review.
-tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@84c52f8
+tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@d73c2c9

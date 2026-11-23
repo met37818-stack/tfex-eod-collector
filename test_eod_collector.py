@@ -692,3 +692,19 @@ class TestSuccessMessageHonesty(unittest.TestCase):
         msg = self._msg()
         self.assertIn("📏", msg)
         self.assertIn("🔁", msg)
+
+    def test_message_stays_compact(self):
+        """Regression guard: the previous layout was ~1,100 characters of headings."""
+        self.assertLessEqual(len(self._msg()), 700)
+        self.assertLessEqual(len(self._msg(is_turso=False)), 750)
+
+    def test_no_warning_block_when_nothing_failed(self):
+        clean = self._msg(thor_6m=0.996)
+        self.assertNotIn("⚠️", clean)
+        self.assertNotIn("ยังไม่พร้อม", clean)
+
+    def test_helpers_render_thai_date_and_clock(self):
+        import eod_collector as ec
+        self.assertEqual(ec._short_thai_date("2026-11-20"), "20 พ.ย.")
+        self.assertEqual(ec._short_thai_date("not-a-date"), "not-a-date")
+        self.assertEqual(ec._clock_bkk("2026-11-23 06:21:14 ICT"), "06:21 ICT")
