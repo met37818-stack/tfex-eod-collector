@@ -645,3 +645,50 @@ class TestStaleRefusalNotifier(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch.object(self.ec, "send_alert", side_effect=RuntimeError("boom")):
                 self.assertFalse(self.ec.notify_stale_refusal("2026-11-20", ["2026-11-19"]))
+
+
+class TestSuccessMessageHonesty(unittest.TestCase):
+    """The message must not claim Turso when it wrote locally, nor "Healthy" always."""
+
+    def _msg(self, **kw):
+        import eod_collector as ec
+        base = dict(latest_date="2026-11-20", now_bkk_str="2026-11-23 06:16:16 ICT",
+                    is_turso=True, fut_cnt=2, opt_cnt=78, inv_cnt=3, mkt_cnt=3,
+                    thor_date="2026-11-20", thor_rate=0.99413, thor_1m=0.99441,
+                    thor_3m=0.99565, thor_6m=0.99600, size_mb=4.45,
+                    retention_stats={"options_snapshots": 0, "futures_snapshots": 0,
+                                     "spot_snapshots": 0})
+        base.update(kw)
+        return ec.format_eod_success_message(**base)
+
+    def test_turso_run_says_turso(self):
+        msg = self._msg()
+        self.assertIn("Turso Cloud", msg)
+        self.assertNotIn("SQLite", msg)
+
+    def test_local_fallback_does_not_claim_turso(self):
+        msg = self._msg(is_turso=False)
+        self.assertNotIn("เขียนลง Turso", msg)
+        self.assertIn("SQLite", msg)
+        self.assertIn("TURSO_DATABASE_URL", msg)
+
+    def test_missing_thor_goes_to_pending_not_n_a(self):
+        msg = self._msg(thor_1m=None, thor_3m=None, thor_6m=None)
+        self.assertIn("THOR 1M", msg)
+        self.assertNotIn("THOR 1M</b>: N/A", msg)
+
+    def test_missing_retention_is_declared(self):
+        msg = self._msg(retention_stats=None)
+        self.assertIn("Retention (ไม่ได้รันในรอบนี้)", msg)
+
+    def test_storage_is_not_called_healthy_at_every_level(self):
+        low = self._msg(size_mb=4.45)
+        high = self._msg(size_mb=4800.0)
+        self.assertNotIn("Healthy", low)
+        self.assertIn("ยังไม่ใช่ข้อจำกัด", low)
+        self.assertIn("ใกล้เพดาน", high)
+
+    def test_three_sections_always_present(self):
+        msg = self._msg()
+        self.assertIn("📏", msg)
+        self.assertIn("🔁", msg)
