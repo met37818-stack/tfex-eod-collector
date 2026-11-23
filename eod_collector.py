@@ -44,6 +44,7 @@ from tfex_common.calendar import (  # noqa: E402
     get_penultimate_business_day,
     is_trading_day,
 )
+from tfex_common.report import Report, bullet  # noqa: E402
 from tfex_common.telegram import send_alert  # noqa: E402
 from tfex_common.turso import execute_pipeline  # noqa: E402
 from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
@@ -1078,13 +1079,19 @@ run_fifo_retention_guard = run_tiered_retention_guard
 
 def format_stale_alert(target_date: str, collected_dates: list) -> str:
     """Telegram body for a refused stale run, HTML-safe."""
-    latest = collected_dates[-1] if collected_dates else "no futures/option rows"
-    return (
-        "<b>EOD collector stopped: data not published yet</b>\n"
-        f"expected trade_date: <code>{target_date}</code>\n"
-        f"latest available: <code>{latest}</code>\n"
-        "Nothing was written. The next scheduled tick will retry."
+    rep = Report(
+        title="EOD collector stopped: data not published yet",
+        subtitle=f"expected trade_date {target_date}",
     )
+    if collected_dates:
+        rep.add_measured(bullet(f"latest available: <code>{collected_dates[-1]}</code>"))
+        rep.add_measured(bullet(f"dates seen: {', '.join(d[5:] for d in collected_dates)}"))
+    else:
+        rep.add_measured(bullet("TFEX returned: no futures/option rows"))
+    rep.add_pending(f"ข้อมูลของ {target_date} (TFEX ยังไม่เผยแพร่)")
+    rep.add_inferred(bullet("ไม่มีการเขียนฐานข้อมูลในรอบนี้ — ตัวเลขเดิมยังอยู่ครบ"))
+    rep.add_watch("รอบถัดไป (06:15 ICT) จะลองใหม่ · ถ้ายังไม่มี ให้ตรวจประกาศ TFEX ก่อนสรุปว่าข้อมูลหาย")
+    return rep.build_telegram()
 
 
 def notify_stale_refusal(target_date: str, collected_dates: list) -> bool:
@@ -1106,6 +1113,97 @@ def notify_stale_refusal(target_date: str, collected_dates: list) -> bool:
 # ==============================================================================
 # TELEGRAM EOD COMPLETION NOTIFIER
 # ==============================================================================
+
+def format_eod_success_message(
+    latest_date: str,
+    now_bkk_str: str,
+    is_turso: bool,
+    fut_cnt: int,
+    opt_cnt: int,
+    inv_cnt: int,
+    mkt_cnt: int,
+    thor_date,
+    thor_rate,
+    thor_1m,
+    thor_3m,
+    thor_6m,
+    size_mb: float,
+    retention_stats=None,
+    fetch_error_count: int = 0,
+    no_data_count: int = 0,
+) -> str:
+    """
+    Success notification for one EOD run.
+
+    Separates measured counts from judgements: the old message called the storage
+    "Healthy" at any fill level and said "ถูกดึงลง Turso" even on the local SQLite
+    fallback, because `is_turso` was computed but never used in the text.
+    """
+    pct = (size_mb / MAX_FREE_QUOTA_MB) * 100
+    dest = "Turso Cloud" if is_turso else "local SQLite"
+    thor_disp_date = thor_date or latest_date
+
+    rep = Report(
+        title=f"TFEX & BOT EOD Collection Complete · {latest_date}",
+        subtitle=f"เขียนลง {dest} เมื่อ {now_bkk_str}",
+    )
+
+    rep.add_measured(bullet(f"<b>Futures Series</b>: <code>{fut_cnt}</code> สัญญา (Active Series)"))
+    opt_line = f"<b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P)"
+    fail_bits = []
+    if fetch_error_count > 0:
+        fail_bits.append(f"error {fetch_error_count}")
+    if no_data_count > 0:
+        fail_bits.append(f"ไม่มีข้อมูล {no_data_count}")
+    if fail_bits:
+        opt_line += f" ⚠️ <i>({' / '.join(fail_bits)} สัญญา)</i>"
+    rep.add_measured(bullet(opt_line))
+    rep.add_measured(bullet(f"<b>Investor Types</b>: <code>{inv_cnt}</code> กลุ่ม (Futures, Calls, Puts)"))
+    rep.add_measured(bullet(f"<b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า"))
+
+    thor_parts = []
+    for label, value in (("Overnight", thor_rate), ("1M", thor_1m), ("3M", thor_3m), ("6M", thor_6m)):
+        if value is not None:
+            thor_parts.append(f"{label} <code>{value:.5f}%</code>")
+        else:
+            rep.add_pending(f"THOR {label}")
+    if thor_parts:
+        rep.add_measured(bullet(f"<b>BOT THOR ({thor_disp_date})</b>: " + " | ".join(thor_parts)))
+
+    rep.add_measured(bullet(
+        f"<b>Storage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code>"
+    ))
+
+    if retention_stats:
+        rep.add_measured(bullet(
+            f"<b>Retention</b>: options(14d) {_format_deleted(retention_stats.get('options_snapshots'))}"
+            f" · futures(90d) {_format_deleted(retention_stats.get('futures_snapshots'))}"
+            f" · spot(90d) {_format_deleted(retention_stats.get('spot_snapshots'))}"
+            f" · eod_* <code>ถาวร</code>"
+        ))
+    else:
+        rep.add_pending("Tiered Retention (ไม่ได้รันในรอบนี้)")
+
+    if pct >= 80.0:
+        rep.add_inferred(bullet(f"Storage ใช้ {pct:.1f}% ของโควตา — ใกล้เพดาน ควรวางแผนย้ายหรือลบ"))
+    else:
+        rep.add_inferred(bullet(f"Storage ใช้ {pct:.2f}% ของโควตา — ยังไม่ใช่ข้อจำกัดในระยะนี้"))
+
+    if not is_turso:
+        rep.add_inferred(bullet(
+            "รอบนี้ไม่มี credential ของ Turso จึงเขียนลงไฟล์ SQLite ในเครื่อง — "
+            "ข้อมูลจะไม่ขึ้น cloud จนกว่าจะตั้ง TURSO_DATABASE_URL / TURSO_AUTH_TOKEN"
+        ))
+
+    if fetch_error_count > 0 or no_data_count > 0:
+        rep.add_watch(
+            f"ถ้าจำนวน options ต่ำกว่าที่คาด หรือ error ซ้ำรอบถัดไป ให้ตรวจ Section 4 "
+            f"(error {fetch_error_count} / no-data {no_data_count})"
+        )
+    rep.add_watch(f"ถ้าจำนวน futures series ไม่ตรงกับ series ที่ active ({fut_cnt}) ให้ตรวจ Section 3")
+
+    return rep.build_telegram()
+
 
 def send_eod_telegram_alert(
     bot_token: str,
@@ -1280,75 +1378,32 @@ def send_eod_telegram_alert(
         return False
 
     # 4. Format Telegram HTML Message
-    pct = (size_mb / MAX_FREE_QUOTA_MB) * 100
-    thor_text = f"<code>{thor_rate:.5f}%</code>" if thor_rate is not None else "N/A"
-    thor_1m_text = f"<code>{thor_1m:.5f}%</code>" if thor_1m is not None else "N/A"
-    thor_3m_text = f"<code>{thor_3m:.5f}%</code>" if thor_3m is not None else "N/A"
-    thor_6m_text = f"<code>{thor_6m:.5f}%</code>" if thor_6m is not None else "N/A"
-    thor_disp_date = thor_date or latest_date
-
-    ret_text = ""
-    if retention_stats:
-        opt_del = retention_stats.get("options_snapshots")
-        fut_del = retention_stats.get("futures_snapshots")
-        spt_del = retention_stats.get("spot_snapshots")
-        ret_text = (
-            f"\n\n<b>🧹 Tiered Retention Maintenance:</b>\n"
-            f"• <b>options_snapshots (14d)</b>: {_format_deleted(opt_del)}\n"
-            f"• <b>futures_snapshots (90d)</b>: {_format_deleted(fut_del)}\n"
-            f"• <b>spot_snapshots (90d)</b>: {_format_deleted(spt_del)}\n"
-            f"• <b>eod_* & daily_realized_vol</b>: <code>ถาวร (ห้ามลบ)</code>"
-        )
-
-    fail_bits = []
-    if fetch_error_count > 0:
-        fail_bits.append(f"error {fetch_error_count}")
-    if no_data_count > 0:
-        fail_bits.append(f"ไม่มีข้อมูล {no_data_count}")
-    opt_fail_text = f" ⚠️ <i>({' / '.join(fail_bits)} สัญญา)</i>" if fail_bits else ""
-    message = (
-        f"📊 <b>TFEX & BOT EOD Collection Complete</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>EOD Data สำหรับวันเทรด {latest_date} ถูกดึงลง Turso เรียบร้อยแล้ว</b>\n\n"
-        f"<b>📦 รายการข้อมูลที่จัดเก็บ ({latest_date}):</b>\n"
-        f"• <b>Futures Series</b>: <code>{fut_cnt}</code> สัญญา (Active Series)\n"
-        f"• <b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P){opt_fail_text}\n"
-        f"• <b>Investor Types</b>: <code>{inv_cnt}</code> กลุ่ม (Futures, Calls, Puts)\n"
-        f"• <b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า\n\n"
-        f"<b>📈 ดอกเบี้ยอ้างอิง BOT THOR ({thor_disp_date}):</b>\n"
-        f"• <b>THOR Overnight</b>: {thor_text}\n"
-        f"• <b>THOR 1M Average</b>: {thor_1m_text}\n"
-        f"• <b>THOR 3M Average</b>: {thor_3m_text}\n"
-        f"• <b>THOR 6M Average</b>: {thor_6m_text}\n\n"
-        f"<b>💾 Turso Database Status:</b>\n"
-        f"• <b>Storage Usage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code> - Healthy\n"
-        f"• <b>Notified At</b>: <code>{now_bkk_str}</code>"
-        f"{ret_text}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    message = format_eod_success_message(
+        latest_date=latest_date,
+        now_bkk_str=now_bkk_str,
+        is_turso=is_turso,
+        fut_cnt=fut_cnt,
+        opt_cnt=opt_cnt,
+        inv_cnt=inv_cnt,
+        mkt_cnt=mkt_cnt,
+        thor_date=thor_date,
+        thor_rate=thor_rate,
+        thor_1m=thor_1m,
+        thor_3m=thor_3m,
+        thor_6m=thor_6m,
+        size_mb=size_mb,
+        retention_stats=retention_stats,
+        fetch_error_count=fetch_error_count,
+        no_data_count=no_data_count,
     )
 
     # 5. Dispatch Message via Telegram Bot API
-    tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
-    try:
-        resp = requests.post(tg_url, json=payload, timeout=15)
-        if resp.status_code != 200:
-            # The response body is a Telegram error envelope (no token); the URL
-            # is never logged because it embeds the bot token.
-            body = (resp.text or "")[:200]
-            print(f"[TELEGRAM] Warning: Telegram API rejected the message ({resp.status_code}): {body}")
-            return False
-        print(f"[TELEGRAM] Notification dispatched successfully to chat_id {chat_id} for trade date {latest_date}.")
-    except requests.RequestException as exc:
-        # requests puts the full URL — including /bot<token>/ — into its exception
-        # messages, so only the exception type is logged.
-        print(f"[TELEGRAM] Error sending message: {type(exc).__name__}")
+    if not send_alert(bot_token, chat_id, message):
+        # send_alert never logs the URL (it embeds the bot token) and returns False
+        # instead of raising, so the run can still record its notification state.
+        print("[TELEGRAM] Warning: alert was not delivered; see the line above.")
         return False
+    print(f"[TELEGRAM] Notification dispatched successfully to chat_id {chat_id} for trade date {latest_date}.")
 
     # 6. Record Notification in eod_telegram_log
     snippet = f"EOD {latest_date} completed (F:{fut_cnt}, O:{opt_cnt}, I:{inv_cnt})"
