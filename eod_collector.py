@@ -941,6 +941,28 @@ def _format_deleted(value: Optional[int]) -> str:
     return "⚠️ ล้มเหลว" if value is None else f"{value:,} แถวถูกลบ"
 
 
+_THAI_MONTHS = ("ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+                "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.")
+
+
+def _short_thai_date(iso_date) -> str:
+    """`2026-11-20` -> `20 พ.ย.` — falls back to the raw text when unparseable."""
+    text = str(iso_date or "").strip()
+    try:
+        dt = datetime.datetime.strptime(text[:10], "%Y-%m-%d")
+    except ValueError:
+        return text
+    return f"{dt.day} {_THAI_MONTHS[dt.month - 1]}"
+
+
+def _clock_bkk(now_bkk_str: str) -> str:
+    """`2026-11-23 06:21:14 ICT` -> `06:21 ICT` (subtitle only needs the clock)."""
+    for part in str(now_bkk_str or "").split():
+        if len(part) >= 5 and part[2] == ":":
+            return f"{part[:5]} ICT"
+    return str(now_bkk_str or "").strip()
+
+
 def run_tiered_retention_guard(
     pipeline_url: str = None,
     auth_token: str = None,
@@ -1078,19 +1100,21 @@ run_fifo_retention_guard = run_tiered_retention_guard
 # signal for it. Notify once, best-effort, without ever masking the exit code.
 
 def format_stale_alert(target_date: str, collected_dates: list) -> str:
-    """Telegram body for a refused stale run, HTML-safe."""
+    """Telegram body for a refused stale run, HTML-safe. Compact layout (style A)."""
     rep = Report(
-        title="EOD collector stopped: data not published yet",
-        subtitle=f"expected trade_date {target_date}",
+        title=f"📊 EOD หยุด · TFEX ยังไม่ประกาศ {target_date}",
+        icon="",
+        measured_heading=None,
+        plan_heading=None,
+        show_divider=False,
     )
     if collected_dates:
-        rep.add_measured(bullet(f"latest available: <code>{collected_dates[-1]}</code>"))
-        rep.add_measured(bullet(f"dates seen: {', '.join(d[5:] for d in collected_dates)}"))
+        rep.add_measured(f"📏 ล่าสุดที่มีใน DB: <code>{collected_dates[-1]}</code>")
     else:
-        rep.add_measured(bullet("TFEX returned: no futures/option rows"))
-    rep.add_pending(f"ข้อมูลของ {target_date} (TFEX ยังไม่เผยแพร่)")
-    rep.add_inferred(bullet("ไม่มีการเขียนฐานข้อมูลในรอบนี้ — ตัวเลขเดิมยังอยู่ครบ"))
-    rep.add_watch("รอบถัดไป (06:15 ICT) จะลองใหม่ · ถ้ายังไม่มี ให้ตรวจประกาศ TFEX ก่อนสรุปว่าข้อมูลหาย")
+        rep.add_measured("📏 TFEX returned: no futures/option rows")
+    rep.add_measured("📏 ไม่ได้เขียนอะไรลง DB รอบนี้ — ตัวเลขเดิมยังอยู่ครบ")
+    rep.add_pending(f"ข้อมูล {target_date} (TFEX ยังไม่เผยแพร่)")
+    rep.add_watch("รอบ 06:15 ICT ลองใหม่ · ถ้ายังไม่มี ให้เช็คประกาศ TFEX ก่อนสรุปว่าข้อมูลหาย")
     return rep.build_telegram()
 
 
@@ -1133,74 +1157,84 @@ def format_eod_success_message(
     no_data_count: int = 0,
 ) -> str:
     """
-    Success notification for one EOD run.
+    Success notification for one EOD run — compact layout (style A).
 
-    Separates measured counts from judgements: the old message called the storage
-    "Healthy" at any fill level and said "ถูกดึงลง Turso" even on the local SQLite
-    fallback, because `is_turso` was computed but never used in the text.
+    One line per fact instead of one section per fact: the full-detail version of
+    this message ran to ~1,100 characters of headings and labels for what is
+    really five numbers and one warning. The measured/inferred split survives as
+    a leading emoji, and the detail it used to carry lives in the Actions log.
+
+    Two rules the older message broke and this one keeps:
+      * never claim Turso when the run fell back to local SQLite (`is_turso`);
+      * never print a value that was not collected — it goes to "ยังไม่พร้อม".
     """
     pct = (size_mb / MAX_FREE_QUOTA_MB) * 100
     dest = "Turso Cloud" if is_turso else "local SQLite"
     thor_disp_date = thor_date or latest_date
 
     rep = Report(
-        title=f"TFEX & BOT EOD Collection Complete · {latest_date}",
-        subtitle=f"เขียนลง {dest} เมื่อ {now_bkk_str}",
+        title=f"📊 EOD {_short_thai_date(latest_date)} · เขียนลง {dest} แล้ว",
+        subtitle=_clock_bkk(now_bkk_str),
+        icon="",
+        measured_heading=None,
+        plan_heading=None,
+        show_divider=False,
     )
 
-    rep.add_measured(bullet(f"<b>Futures Series</b>: <code>{fut_cnt}</code> สัญญา (Active Series)"))
-    opt_line = f"<b>Options Series</b>: <code>{opt_cnt}</code> สัญญา (All Strikes C/P)"
     fail_bits = []
     if fetch_error_count > 0:
         fail_bits.append(f"error {fetch_error_count}")
     if no_data_count > 0:
         fail_bits.append(f"ไม่มีข้อมูล {no_data_count}")
-    if fail_bits:
-        opt_line += f" ⚠️ <i>({' / '.join(fail_bits)} สัญญา)</i>"
-    rep.add_measured(bullet(opt_line))
-    rep.add_measured(bullet(f"<b>Investor Types</b>: <code>{inv_cnt}</code> กลุ่ม (Futures, Calls, Puts)"))
-    rep.add_measured(bullet(f"<b>Market Stats</b>: <code>{mkt_cnt}</code> หมวดสินค้า"))
+    opt_flag = " ⚠️" if fail_bits else ""
+    rep.add_measured(
+        f"📏 Futures <b>{fut_cnt}</b> · Options <b>{opt_cnt}</b>{opt_flag} · "
+        f"Investor {inv_cnt} · Market {mkt_cnt}"
+    )
 
     thor_parts = []
-    for label, value in (("Overnight", thor_rate), ("1M", thor_1m), ("3M", thor_3m), ("6M", thor_6m)):
+    for label, value in (("ON", thor_rate), ("1M", thor_1m), ("3M", thor_3m), ("6M", thor_6m)):
         if value is not None:
-            thor_parts.append(f"{label} <code>{value:.5f}%</code>")
+            thor_parts.append(f"{label} <code>{value:.4f}%</code>")
         else:
             rep.add_pending(f"THOR {label}")
     if thor_parts:
-        rep.add_measured(bullet(f"<b>BOT THOR ({thor_disp_date})</b>: " + " | ".join(thor_parts)))
+        rep.add_measured(f"📏 THOR {_short_thai_date(thor_disp_date)}: " + " · ".join(thor_parts))
 
-    rep.add_measured(bullet(
-        f"<b>Storage</b>: <code>{size_mb:.2f} MB / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code>"
-    ))
-
+    storage_line = f"📏 DB <code>{size_mb:.1f} / {MAX_FREE_QUOTA_MB:.0f} MB ({pct:.2f}%)</code>"
     if retention_stats:
-        rep.add_measured(bullet(
-            f"<b>Retention</b>: options(14d) {_format_deleted(retention_stats.get('options_snapshots'))}"
-            f" · futures(90d) {_format_deleted(retention_stats.get('futures_snapshots'))}"
-            f" · spot(90d) {_format_deleted(retention_stats.get('spot_snapshots'))}"
-            f" · eod_* <code>ถาวร</code>"
-        ))
+        removed = sum(
+            value for value in (
+                retention_stats.get("options_snapshots"),
+                retention_stats.get("futures_snapshots"),
+                retention_stats.get("spot_snapshots"),
+            ) if isinstance(value, int)
+        )
+        if removed:
+            storage_line += f" · ลบ snapshot แล้ว {removed:,} แถว"
     else:
-        rep.add_pending("Tiered Retention (ไม่ได้รันในรอบนี้)")
+        storage_line += " · Retention (ไม่ได้รันในรอบนี้)"
+    rep.add_measured(storage_line)
 
-    if pct >= 80.0:
-        rep.add_inferred(bullet(f"Storage ใช้ {pct:.1f}% ของโควตา — ใกล้เพดาน ควรวางแผนย้ายหรือลบ"))
-    else:
-        rep.add_inferred(bullet(f"Storage ใช้ {pct:.2f}% ของโควตา — ยังไม่ใช่ข้อจำกัดในระยะนี้"))
+    if fail_bits:
+        rep.add_pending(f"Options {' / '.join(fail_bits)}")
 
     if not is_turso:
-        rep.add_inferred(bullet(
-            "รอบนี้ไม่มี credential ของ Turso จึงเขียนลงไฟล์ SQLite ในเครื่อง — "
-            "ข้อมูลจะไม่ขึ้น cloud จนกว่าจะตั้ง TURSO_DATABASE_URL / TURSO_AUTH_TOKEN"
-        ))
-
-    if fetch_error_count > 0 or no_data_count > 0:
-        rep.add_watch(
-            f"ถ้าจำนวน options ต่ำกว่าที่คาด หรือ error ซ้ำรอบถัดไป ให้ตรวจ Section 4 "
-            f"(error {fetch_error_count} / no-data {no_data_count})"
+        rep.add_measured(
+            "📏 รอบนี้ไม่มี credential ของ Turso → เขียนลง SQLite ในเครื่อง · "
+            "ข้อมูลไม่ขึ้น cloud จนกว่าจะตั้ง TURSO_DATABASE_URL / TURSO_AUTH_TOKEN"
         )
-    rep.add_watch(f"ถ้าจำนวน futures series ไม่ตรงกับ series ที่ active ({fut_cnt}) ให้ตรวจ Section 3")
+
+    if pct >= 80.0:
+        rep.add_inferred(bullet(f"DB ใช้ {pct:.1f}% ของโควตา — ใกล้เพดาน ควรวางแผนย้ายหรือลบ"))
+    else:
+        rep.add_inferred(bullet(f"DB ใช้ {pct:.2f}% ของโควตา — ยังไม่ใช่ข้อจำกัดในระยะนี้"))
+
+    watch_bits = []
+    if fail_bits:
+        watch_bits.append("options error/no-data ซ้ำอีกรอบ → ตรวจ Section 4")
+    watch_bits.append(f"futures series ไม่ครบ {fut_cnt} → ตรวจ Section 3")
+    rep.add_watch(" · ".join(watch_bits))
 
     return rep.build_telegram()
 
